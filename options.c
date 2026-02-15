@@ -64,6 +64,7 @@ extern double soapy_gain_val;
 extern int bias_tee;
 extern int use_gpu;
 extern int no_simd;
+extern char *save_bursts_dir;
 extern int web_enabled;
 extern int web_port;
 extern int gsmtap_enabled;
@@ -111,6 +112,7 @@ static void usage(int exitcode) {
 "\n"
 "Output options:\n"
 "    --file-info=STR         file info string for output (default: auto)\n"
+"    --save-bursts=DIR       save IQ samples of decoded bursts to directory\n"
 "    -v, --verbose           verbose output to stderr\n"
 "    -h, --help              show this help\n"
 "    --list                  list available SDR interfaces\n"
@@ -154,6 +156,7 @@ void parse_options(int argc, char **argv) {
         OPT_NO_SIMD,
         OPT_WEB,
         OPT_GSMTAP,
+        OPT_SAVE_BURSTS,
     };
 
     static const struct option longopts[] = {
@@ -179,6 +182,7 @@ void parse_options(int argc, char **argv) {
         { "no-simd",        no_argument,       NULL, OPT_NO_SIMD },
         { "web",            optional_argument, NULL, OPT_WEB },
         { "gsmtap",         optional_argument, NULL, OPT_GSMTAP },
+        { "save-bursts",    required_argument, NULL, OPT_SAVE_BURSTS },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -286,6 +290,10 @@ void parse_options(int argc, char **argv) {
                         gsmtap_host = strdup(optarg);
                     }
                 }
+                break;
+
+            case OPT_SAVE_BURSTS:
+                save_bursts_dir = strdup(optarg);
                 break;
 
             case 'h':

@@ -113,6 +113,31 @@ The IDA decoder implements:
 
 GSMTAP runs alongside normal RAW output and the web map. Adding `--gsmtap` does not change stdout.
 
+## Burst IQ Capture
+
+The `--save-bursts` option saves IQ samples from successfully decoded bursts to a directory for offline analysis, algorithm development, or research.
+
+```bash
+# Save all decoded bursts
+./iridium-sniffer -l --save-bursts bursts/
+
+# Process file and save bursts
+./iridium-sniffer -f recording.cf32 --format=cf32 --save-bursts bursts/
+```
+
+**Output files per burst:**
+- `<timestamp>_<freq>_<id>_<direction>.cf32` - Complex float32 IQ samples (RRC-filtered, aligned to unique word)
+- `<timestamp>_<freq>_<id>_<direction>.meta` - Metadata (burst ID, frequency, SNR, sample rate, etc.)
+
+**Use cases:**
+- RF fingerprinting and satellite authentication research
+- Algorithm development and testing without live satellite passes
+- Building datasets for signal processing research
+- Debugging demodulation issues on specific bursts
+- Regression testing with real satellite data
+
+Captured IQ is at 250 kHz sample rate, 10 samples per symbol, after RRC matched filtering. Each file contains one complete burst ready for demodulation.
+
 **API endpoints:**
 
 | Endpoint | Description |

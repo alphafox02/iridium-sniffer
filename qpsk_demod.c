@@ -24,9 +24,14 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 #include "qpsk_demod.h"
 #include "iridium.h"
+
+extern char *save_bursts_dir;
 
 #define PLL_ALPHA           0.2f
 #define M_SQRT1_2f          0.70710678118654752f
@@ -244,6 +249,60 @@ static void map_symbols_to_bits(const int *symbols, int n, uint8_t *bits)
     }
 }
 
+/* ---- Burst IQ sample saving (for research/analysis) ---- */
+
+static void save_burst_iq(downmix_frame_t *in, const char *dir_name)
+{
+    if (!dir_name) return;
+
+    /* Create directory if it doesn't exist */
+    struct stat st = {0};
+    if (stat(dir_name, &st) == -1) {
+        if (mkdir(dir_name, 0755) == -1 && errno != EEXIST) {
+            fprintf(stderr, "Warning: failed to create burst save directory: %s\n",
+                    strerror(errno));
+            return;
+        }
+    }
+
+    /* Format: <timestamp>_<freq>_<id>_<direction>.cf32 */
+    const char *dir_str = (in->direction == DIR_DOWNLINK) ? "DL" :
+                          (in->direction == DIR_UPLINK) ? "UL" : "UN";
+
+    char filename[512];
+    snprintf(filename, sizeof(filename), "%s/%020lu_%011.0f_%lu_%s",
+             dir_name, in->timestamp, in->center_frequency, in->id, dir_str);
+
+    /* Save IQ samples (cf32 format) */
+    char iq_file[520];
+    snprintf(iq_file, sizeof(iq_file), "%s.cf32", filename);
+    FILE *f = fopen(iq_file, "wb");
+    if (!f) {
+        fprintf(stderr, "Warning: failed to save burst IQ: %s\n", strerror(errno));
+        return;
+    }
+    fwrite(in->samples, sizeof(float complex), in->num_samples, f);
+    fclose(f);
+
+    /* Save metadata */
+    char meta_file[520];
+    snprintf(meta_file, sizeof(meta_file), "%s.meta", filename);
+    f = fopen(meta_file, "w");
+    if (!f) return;
+
+    fprintf(f, "burst_id: %lu\n", in->id);
+    fprintf(f, "timestamp_ns: %lu\n", in->timestamp);
+    fprintf(f, "center_freq_hz: %.0f\n", in->center_frequency);
+    fprintf(f, "sample_rate_hz: %.0f\n", in->sample_rate);
+    fprintf(f, "samples_per_symbol: %.2f\n", in->samples_per_symbol);
+    fprintf(f, "direction: %s\n", dir_str);
+    fprintf(f, "magnitude_db: %.2f\n", in->magnitude);
+    fprintf(f, "noise_dbfs_hz: %.2f\n", in->noise);
+    fprintf(f, "num_samples: %zu\n", in->num_samples);
+    fprintf(f, "uw_start_offset: %.2f\n", in->uw_start);
+    fclose(f);
+}
+
 /* ---- Main demodulation function ---- */
 
 int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
@@ -308,6 +367,11 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
             else if (dl_ok && !ul_ok)
                 in->direction = DIR_DOWNLINK;
         }
+    }
+
+    /* Save burst IQ if requested (for research/analysis) */
+    if (save_bursts_dir) {
+        save_burst_iq(in, save_bursts_dir);
     }
 
     /* Step 5: DQPSK differential decode */
