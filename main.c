@@ -105,9 +105,9 @@ pid_t self_pid;
 
 /* Queues */
 #define SAMPLES_QUEUE_SIZE 4096
-#define BURST_QUEUE_SIZE   512
+#define BURST_QUEUE_SIZE   2048
 #define FRAME_QUEUE_SIZE   512
-#define NUM_DOWNMIX_WORKERS 2
+#define NUM_DOWNMIX_WORKERS 4
 Blocking_Queue samples_queue;
 Blocking_Queue burst_queue;
 Blocking_Queue frame_queue;

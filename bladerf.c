@@ -58,9 +58,11 @@ struct bladerf *bladerf_setup(int id) {
     if (version.major == 2 && version.minor == 5 && version.patch == 0)
         num_samples_workaround = 1;
 
-    bladerf_set_usb_reset_on_open(true);
-    if ((status = bladerf_open(&bladerf, identifier)) != 0)
-        errx(1, "Unable to open bladeRF: %s", bladerf_strerror(status));
+    if ((status = bladerf_open(&bladerf, identifier)) != 0) {
+        /* Retry with NULL (any device) if instance match fails */
+        if ((status = bladerf_open(&bladerf, NULL)) != 0)
+            errx(1, "Unable to open bladeRF: %s", bladerf_strerror(status));
+    }
 
     if ((status = bladerf_set_bandwidth(bladerf, BLADERF_CHANNEL_RX(0), (unsigned)(samp_rate * 0.9), NULL)) != 0)
         errx(1, "Unable to set bladeRF bandwidth: %s", bladerf_strerror(status));
@@ -87,11 +89,12 @@ void *bladerf_rx_cb(struct bladerf *bladerf, struct bladerf_stream *stream, stru
     if (num_samples_workaround)
         num_samples *= 2;
 
-    sample_buf_t *s = malloc(sizeof(*s) + num_samples * sizeof(int8_t) * 2);
-    s->format = SAMPLE_FMT_INT8;
+    sample_buf_t *s = malloc(sizeof(*s) + num_samples * sizeof(float) * 2);
+    s->format = SAMPLE_FMT_FLOAT;
     s->num = num_samples;
+    float *out = (float *)s->samples;
     for (i = 0; i < num_samples * 2; ++i)
-        s->samples[i] = (int8_t)(d[i] >> 4);
+        out[i] = d[i] * (1.0f / 2048.0f);
 
     if (running)
         push_samples(s);

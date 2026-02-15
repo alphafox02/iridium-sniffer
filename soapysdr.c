@@ -25,7 +25,7 @@ extern double soapy_gain_val;
 extern int bias_tee;
 extern int verbose;
 
-static int use_cs16 = 0;
+static int sample_mode = 0;  /* 0=CS8, 1=CF32, 2=CS16 (fallback) */
 
 void soapy_list(void) {
     size_t length;
@@ -71,19 +71,23 @@ SoapySDRDevice *soapy_setup(int id) {
     if (device == NULL)
         errx(1, "Unable to open SoapySDR device: %s", SoapySDRDevice_lastError());
 
-    /* Check supported formats and prefer CS8 */
+    /* Check supported formats: prefer CS8, then CF32, then CS16 */
     formats = SoapySDRDevice_getStreamFormats(device, SOAPY_SDR_RX, 0, &num_formats);
-    use_cs16 = 1;
+    sample_mode = 2;  /* CS16 fallback */
     for (size_t i = 0; i < num_formats; ++i) {
         if (strcmp(formats[i], SOAPY_SDR_CS8) == 0) {
-            use_cs16 = 0;
+            sample_mode = 0;
             break;
         }
+        if (strcmp(formats[i], SOAPY_SDR_CF32) == 0)
+            sample_mode = 1;
     }
     SoapySDRStrings_clear(&formats, num_formats);
 
-    if (verbose)
-        fprintf(stderr, "SoapySDR: using %s format\n", use_cs16 ? "CS16" : "CS8");
+    if (verbose) {
+        const char *fmt_name[] = { "CS8", "CF32", "CS16" };
+        fprintf(stderr, "SoapySDR: using %s format\n", fmt_name[sample_mode]);
+    }
 
     if (SoapySDRDevice_setSampleRate(device, SOAPY_SDR_RX, 0, samp_rate) != 0)
         errx(1, "Unable to set SoapySDR sample rate: %s", SoapySDRDevice_lastError());
@@ -111,9 +115,9 @@ SoapySDRDevice *soapy_setup(int id) {
     return device;
 }
 
-static void soapy_rx_cs16(int16_t *in, int8_t *out, size_t num_samples) {
+static void soapy_cs16_to_float(int16_t *in, float *out, size_t num_samples) {
     for (size_t i = 0; i < num_samples * 2; ++i)
-        out[i] = (int8_t)(in[i] >> 8);
+        out[i] = in[i] * (1.0f / 32768.0f);
 }
 
 void *soapy_stream_thread(void *arg) {
@@ -125,20 +129,31 @@ void *soapy_stream_thread(void *arg) {
     const char *format;
     size_t mtu;
 
-    if (!use_cs16) {
+    if (sample_mode == 0) {
         format = SOAPY_SDR_CS8;
         stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
                                              &channel, 1, NULL);
         if (stream == NULL) {
             if (verbose)
-                warnx("CS8 stream failed, falling back to CS16");
-            use_cs16 = 1;
+                warnx("CS8 stream failed, trying CF32");
+            sample_mode = 1;
         }
     } else {
         stream = NULL;
     }
 
-    if (use_cs16) {
+    if (stream == NULL && sample_mode == 1) {
+        format = SOAPY_SDR_CF32;
+        stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
+                                             &channel, 1, NULL);
+        if (stream == NULL) {
+            if (verbose)
+                warnx("CF32 stream failed, falling back to CS16");
+            sample_mode = 2;
+        }
+    }
+
+    if (stream == NULL) {
         format = SOAPY_SDR_CS16;
         stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
                                              &channel, 1, NULL);
@@ -157,14 +172,18 @@ void *soapy_stream_thread(void *arg) {
         errx(1, "Unable to activate SoapySDR stream: %s", SoapySDRDevice_lastError());
 
     int16_t *cs16_buf = NULL;
-    if (use_cs16) {
+    if (sample_mode == 2) {
         cs16_buf = malloc(mtu * 2 * sizeof(int16_t));
         if (cs16_buf == NULL)
             errx(1, "Unable to allocate CS16 buffer");
     }
 
+    /* Sample size per IQ pair depends on format */
+    size_t sample_size = (sample_mode == 0) ? 2 * sizeof(int8_t)
+                                            : 2 * sizeof(float);
+
     while (running) {
-        sample_buf_t *s = malloc(sizeof(*s) + mtu * 2 * sizeof(int8_t));
+        sample_buf_t *s = malloc(sizeof(*s) + mtu * sample_size);
         if (s == NULL) {
             warnx("Unable to allocate sample buffer");
             break;
@@ -173,13 +192,20 @@ void *soapy_stream_thread(void *arg) {
         void *buffs[1];
         int ret;
 
-        if (use_cs16) {
+        if (sample_mode == 2) {
+            /* CS16 -> float conversion */
             buffs[0] = cs16_buf;
             ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
                                              &flags, &time_ns, 100000);
             if (ret > 0)
-                soapy_rx_cs16(cs16_buf, s->samples, ret);
+                soapy_cs16_to_float(cs16_buf, (float *)s->samples, ret);
+        } else if (sample_mode == 1) {
+            /* CF32 direct */
+            buffs[0] = s->samples;
+            ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
+                                             &flags, &time_ns, 100000);
         } else {
+            /* CS8 direct */
             buffs[0] = s->samples;
             ret = SoapySDRDevice_readStream(device, stream, buffs, mtu,
                                              &flags, &time_ns, 100000);
@@ -201,7 +227,7 @@ void *soapy_stream_thread(void *arg) {
             break;
         }
 
-        s->format = SAMPLE_FMT_INT8;
+        s->format = (sample_mode == 0) ? SAMPLE_FMT_INT8 : SAMPLE_FMT_FLOAT;
         s->num = ret;
         if (running)
             push_samples(s);
