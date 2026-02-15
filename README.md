@@ -1,10 +1,10 @@
 # iridium-sniffer
 
-A standalone Iridium satellite burst detector and demodulator written in C. It replaces [gr-iridium](https://github.com/muccc/gr-iridium) by removing the GNU Radio dependency entirely, while producing the same [iridium-toolkit](https://github.com/muccc/iridium-toolkit) compatible RAW output on stdout.
+A standalone Iridium satellite burst detector and demodulator written in C. It provides an alternative to [gr-iridium](https://github.com/muccc/gr-iridium) by eliminating the GNU Radio dependency, while producing the same [iridium-toolkit](https://github.com/muccc/iridium-toolkit) compatible RAW output on stdout. For users who want a lighter-weight, dependency-free option or need embedded deployment, this offers similar functionality with a different architectural approach.
 
 Supports HackRF, BladeRF, USRP (UHD), and SoapySDR for live capture, or processes IQ recordings from file. Optional GPU-accelerated burst detection is available via OpenCL or Vulkan, including on the Raspberry Pi 5.
 
-A built-in web map (`--web`) provides a real-time Leaflet.js visualization of decoded ring alert positions and active satellites -- no external tools or Python required.
+A built-in web map (`--web`, beta) provides a real-time Leaflet.js visualization of decoded ring alert positions and active satellites -- no external tools or Python required.
 
 Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames directly to Wireshark via UDP, eliminating the need for the Python `iridium-parser.py -m gsmtap` pipeline.
 
@@ -49,9 +49,11 @@ Tested against gr-iridium on a 60-second IQ recording at 10 MHz from a USRP B210
 
 In live capture, iridium-sniffer produces roughly twice as many decoded frames per second as gr-iridium. The burst detector is more aggressive and catches weaker signals that a conservative detector skips. The extra bursts that fail the unique word check are silently discarded and never appear in the output.
 
-## Built-in Web Map
+## Built-in Web Map (Beta)
 
 The `--web` flag starts an embedded HTTP server that decodes IRA (ring alert) and IBC (broadcast) frames in real time and displays them on a map. This provides similar functionality to [Iridium Live](https://github.com/microp11/iridium-live) without any external dependencies.
+
+**Note:** The web map feature is currently in beta. Position plotting and satellite tracking are functional but undergoing validation.
 
 ```bash
 # Default port 8888
@@ -123,29 +125,49 @@ The frame decoder implements BCH(31,21) error correction with two-bit correction
 
 ## Dependencies
 
-**Required:**
+### Minimal Build (CPU-only, file processing)
+
+For processing IQ recordings without SDR or GPU support:
 
 ```bash
 sudo apt install build-essential cmake libfftw3-dev
 ```
 
-**SDR backends** (at least one needed for live capture):
+This builds a CPU-only binary that reads files but cannot capture from SDRs or use GPU acceleration.
+
+### Standard Build (CPU + SDR)
+
+Add at least one SDR backend for live capture:
 
 ```bash
-sudo apt install libhackrf-dev     # HackRF
+# Start with minimal build, then add SDR libraries:
+sudo apt install libhackrf-dev     # HackRF One
 sudo apt install libbladerf-dev    # BladeRF
-sudo apt install libuhd-dev        # USRP (UHD)
+sudo apt install libuhd-dev        # USRP (B2x0, N2x0, X3x0, etc.)
 sudo apt install libsoapysdr-dev   # SoapySDR (RTL-SDR, Airspy, LimeSDR, etc.)
 ```
 
-**GPU acceleration** (optional):
+Install only the libraries for SDRs you own. CMake auto-detects what's available.
+
+### GPU-Accelerated Build
+
+For GPU-accelerated burst detection on desktop/laptop:
 
 ```bash
-# OpenCL (NVIDIA, AMD, Intel)
+# Standard build + OpenCL (NVIDIA, AMD, Intel)
 sudo apt install ocl-icd-opencl-dev
+```
 
-# Vulkan (Raspberry Pi 5, NVIDIA, AMD)
+### Raspberry Pi 5 Build
+
+Pi 5 has no OpenCL support, use Vulkan instead:
+
+```bash
+# Minimal build + Vulkan (VideoCore VII GPU)
 sudo apt install libvulkan-dev glslang-dev spirv-tools
+
+# Plus SoapySDR for RTL-SDR/Airspy/etc.
+sudo apt install libsoapysdr-dev
 ```
 
 ## Build

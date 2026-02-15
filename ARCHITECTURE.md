@@ -16,7 +16,7 @@ SDR / IQ File
      |
      v  burst_queue (512 slots)
      |
-[Downmix Workers]    -- 2 threads, pull from shared queue
+[Downmix Workers]    -- 4 threads, pull from shared queue
   |  Coarse CFO correction (frequency shift)
   |  LPF + decimation to 250 kHz (10 sps)
   |  Noise-limiting LPF (20 kHz cutoff, 25 taps)
