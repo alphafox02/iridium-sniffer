@@ -44,6 +44,9 @@
 #define BCH_RA_DATA   21     /* 31 - 10 = 21 data bits */
 #define BCH_HDR_DATA  3      /* 7 - 4 = 3 data bits */
 
+/* Chase decoder: flip up to N least-reliable bits, retry BCH */
+#define CHASE_FLIP_BITS 5    /* 2^5 = 32 combinations per failed block */
+
 /* Access codes (24 bits after UW) */
 static const uint8_t access_dl[] = {
     0,0,1,1,0,0,0,0,0,0,1,1,0,0,0,0,1,1,1,1,0,0,1,1
@@ -195,6 +198,102 @@ static void de_interleave3(const uint8_t *in,
     }
 }
 
+/* ---- Soft de-interleaving (LLR follows same permutation as bits) ---- */
+
+static void de_interleave_llr(const float *in, float *out1, float *out2)
+{
+    int p = 0;
+    for (int s = 31; s >= 1; s -= 2) {
+        out1[p++] = in[2 * s];
+        out1[p++] = in[2 * s + 1];
+    }
+    p = 0;
+    for (int s = 30; s >= 0; s -= 2) {
+        out2[p++] = in[2 * s];
+        out2[p++] = in[2 * s + 1];
+    }
+}
+
+/* ---- Chase BCH(31,21) decoder ----
+ *
+ * When standard BCH fails (>2 errors), flip the least-reliable bit
+ * positions (guided by LLR) and retry. With CHASE_FLIP_BITS=5 and
+ * BCH t=2, can correct up to 7 errors if the right positions are flipped.
+ */
+
+static int chase_bch_decode_p(const uint8_t *block32, const float *llr32,
+                                uint8_t *out_data, uint8_t *out_check)
+{
+    /* Try standard BCH first */
+    uint32_t val = bits_to_uint(block32, 31);
+    uint32_t syndrome = gf2_remainder(BCH_POLY_RA, val);
+
+    if (syndrome == 0) {
+        uint_to_bits(val >> 10, out_data, BCH_RA_DATA);
+        uint_to_bits(val & 0x3FF, out_check, 10);
+        return 0;
+    }
+
+    if (syndrome < 1024 && syn_ra[syndrome].errs >= 0) {
+        val ^= syn_ra[syndrome].locator;
+        uint_to_bits(val >> 10, out_data, BCH_RA_DATA);
+        uint_to_bits(val & 0x3FF, out_check, 10);
+        return syn_ra[syndrome].errs;
+    }
+
+    /* Standard BCH failed -- Chase decode with soft info */
+    if (!llr32)
+        return -1;
+
+    /* Find CHASE_FLIP_BITS least-reliable positions within the 31-bit codeword.
+     * Simple partial selection sort (N=5 from 31 elements). */
+    int pos[31];
+    for (int i = 0; i < 31; i++)
+        pos[i] = i;
+
+    for (int i = 0; i < CHASE_FLIP_BITS; i++) {
+        int min_idx = i;
+        for (int j = i + 1; j < 31; j++) {
+            if (llr32[pos[j]] < llr32[pos[min_idx]])
+                min_idx = j;
+        }
+        int tmp = pos[i];
+        pos[i] = pos[min_idx];
+        pos[min_idx] = tmp;
+    }
+
+    /* Pre-compute flip masks for each candidate position.
+     * bits_to_uint puts bit[0] at bit position 30, bit[k] at position (30-k). */
+    uint32_t flip_mask[CHASE_FLIP_BITS];
+    for (int i = 0; i < CHASE_FLIP_BITS; i++)
+        flip_mask[i] = 1u << (30 - pos[i]);
+
+    /* Try all 2^CHASE_FLIP_BITS - 1 non-zero combinations */
+    uint32_t base_val = bits_to_uint(block32, 31);
+    for (int mask = 1; mask < (1 << CHASE_FLIP_BITS); mask++) {
+        uint32_t flipped = base_val;
+        for (int b = 0; b < CHASE_FLIP_BITS; b++) {
+            if (mask & (1 << b))
+                flipped ^= flip_mask[b];
+        }
+
+        syndrome = gf2_remainder(BCH_POLY_RA, flipped);
+        if (syndrome == 0) {
+            uint_to_bits(flipped >> 10, out_data, BCH_RA_DATA);
+            uint_to_bits(flipped & 0x3FF, out_check, 10);
+            return 0;
+        }
+        if (syndrome < 1024 && syn_ra[syndrome].errs >= 0) {
+            flipped ^= syn_ra[syndrome].locator;
+            uint_to_bits(flipped >> 10, out_data, BCH_RA_DATA);
+            uint_to_bits(flipped & 0x3FF, out_check, 10);
+            return syn_ra[syndrome].errs;
+        }
+    }
+
+    return -1;
+}
+
 /* ---- IRA field extraction ---- */
 
 static int extract_signed12(const uint8_t *bits)
@@ -302,30 +401,8 @@ static int check_parity32(const uint8_t *block32, const uint8_t *bch_data,
     return (ones % 2) == 0;
 }
 
-/* ---- BCH decode with parity ----
- * Decodes a 32-bit block (31 BCH + 1 parity). Returns error count
- * or -1 on failure. Writes data and check bits for parity verification. */
-
-static int bch_decode_p(const uint8_t *block32, uint8_t *out_data, uint8_t *out_check)
-{
-    uint32_t val = bits_to_uint(block32, 31);
-    uint32_t syndrome = gf2_remainder(BCH_POLY_RA, val);
-
-    if (syndrome == 0) {
-        uint_to_bits(val >> 10, out_data, BCH_RA_DATA);
-        uint_to_bits(val & 0x3FF, out_check, 10);
-        return 0;
-    }
-
-    if (syndrome < 1024 && syn_ra[syndrome].errs >= 0) {
-        val ^= syn_ra[syndrome].locator;
-        uint_to_bits(val >> 10, out_data, BCH_RA_DATA);
-        uint_to_bits(val & 0x3FF, out_check, 10);
-        return syn_ra[syndrome].errs;
-    }
-
-    return -1;
-}
+/* bch_decode_p: superseded by chase_bch_decode_p which includes
+ * the same standard BCH decode as its first step. */
 
 /* ---- Main decode function ---- */
 
@@ -350,6 +427,7 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
 
     /* Frame data starts after the access code */
     const uint8_t *data = frame->bits + 24;
+    const float *data_llr = frame->llr ? frame->llr + 24 : NULL;
     int data_len = frame->n_bits - 24;
 
     /* ---- Try IBC detection ----
@@ -389,13 +467,18 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
                 memcpy(bch_stream + bch_len, d2, BCH_RA_DATA);
                 bch_len += BCH_RA_DATA;
 
-                /* Remaining 64-bit blocks with BCH correction + parity */
+                /* Remaining 64-bit blocks with Chase BCH + parity */
                 uint8_t rc1[10], rc2[10];
+                float li1[32], li2[32];
                 int offset = 6 + 64;
                 while (offset + 64 <= ibc_max && bch_len + 2 * BCH_RA_DATA <= (int)sizeof(bch_stream)) {
                     de_interleave(data + offset, di1, di2);
-                    int ea = bch_decode_p(di1, d1, rc1);
-                    int eb = bch_decode_p(di2, d2, rc2);
+                    if (data_llr && offset + 64 <= data_len)
+                        de_interleave_llr(data_llr + offset, li1, li2);
+                    int ea = chase_bch_decode_p(di1,
+                                data_llr ? li1 : NULL, d1, rc1);
+                    int eb = chase_bch_decode_p(di2,
+                                data_llr ? li2 : NULL, d2, rc2);
                     if (ea < 0 || eb < 0) break;
                     if (!check_parity32(di1, d1, BCH_RA_DATA, rc1, 10)) break;
                     if (!check_parity32(di2, d2, BCH_RA_DATA, rc2, 10)) break;
@@ -447,15 +530,20 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
             memcpy(bch_stream + bch_len, d3, BCH_RA_DATA);
             bch_len += BCH_RA_DATA;
 
-            /* Remaining 64-bit blocks with BCH correction + parity */
+            /* Remaining 64-bit blocks with Chase BCH + parity */
             uint8_t di1[32], di2[32];
+            float li1[32], li2[32];
             uint8_t rd1[BCH_RA_DATA], rd2[BCH_RA_DATA];
             uint8_t rc1[10], rc2[10];
             int offset = 96;
             while (offset + 64 <= data_len && bch_len + 2 * BCH_RA_DATA <= (int)sizeof(bch_stream)) {
                 de_interleave(data + offset, di1, di2);
-                int ea = bch_decode_p(di1, rd1, rc1);
-                int eb = bch_decode_p(di2, rd2, rc2);
+                if (data_llr)
+                    de_interleave_llr(data_llr + offset, li1, li2);
+                int ea = chase_bch_decode_p(di1,
+                            data_llr ? li1 : NULL, rd1, rc1);
+                int eb = chase_bch_decode_p(di2,
+                            data_llr ? li2 : NULL, rd2, rc2);
                 if (ea < 0 || eb < 0) break;
                 if (!check_parity32(di1, rd1, BCH_RA_DATA, rc1, 10)) break;
                 if (!check_parity32(di2, rd2, BCH_RA_DATA, rc2, 10)) break;

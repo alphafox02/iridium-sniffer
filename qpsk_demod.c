@@ -478,6 +478,25 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
     }
     map_symbols_to_bits(symbols, actual_symbols, bits);
 
+    /* Step 7: Compute per-bit soft reliability (LLR magnitude) from PLL output.
+     * For QPSK: MSB reliability = |Re(symbol)|, LSB = |Im(symbol)|.
+     * Normalized so average constellation distance = 1.0. */
+    float *llr = malloc(n_bits * sizeof(float));
+    if (llr) {
+        /* Compute average magnitude for normalization */
+        float sum_mag = 0;
+        for (int i = 0; i < actual_symbols; i++)
+            sum_mag += cabsf(pll_out[i]);
+        float scale = (actual_symbols > 0 && sum_mag > 0)
+                    ? (M_SQRT1_2f / (sum_mag / actual_symbols))
+                    : 1.0f;
+
+        for (int i = 0; i < actual_symbols; i++) {
+            llr[2 * i]     = fabsf(crealf(pll_out[i])) * scale;
+            llr[2 * i + 1] = fabsf(cimagf(pll_out[i])) * scale;
+        }
+    }
+
     /* Build output frame */
     demod_frame_t *frame = calloc(1, sizeof(demod_frame_t));
     frame->id = in->id;
@@ -490,6 +509,7 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
     frame->n_symbols = actual_symbols;
     frame->n_payload_symbols = actual_symbols - IR_UW_LENGTH;
     frame->bits = bits;
+    frame->llr = llr;
     frame->n_bits = n_bits;
 
     /* Refine center frequency with PLL-measured residual CFO */

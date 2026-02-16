@@ -33,6 +33,7 @@ typedef struct {
     int n_symbols;              /* total symbols including UW */
     int n_payload_symbols;      /* symbols after UW */
     uint8_t *bits;              /* 2 bits per symbol (0 or 1 each) */
+    float *llr;                 /* per-bit reliability (|distance from boundary|) */
     int n_bits;
 } demod_frame_t;
 

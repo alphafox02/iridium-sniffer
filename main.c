@@ -285,6 +285,7 @@ static void *frame_consumer_thread(void *arg) {
             }
 
             free(demod->bits);
+            free(demod->llr);
             free(demod);
         } else if (verbose) {
             fprintf(stderr, "demod: UW check failed id=%lu freq=%.0f Hz dir=%s\n",
