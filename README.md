@@ -43,15 +43,31 @@ make -j$(nproc)
 
 Tested against gr-iridium on a 60-second IQ recording (cf32, 10 MHz, 1622 MHz center, USRP B210):
 
+**Default threshold (16 dB) -- maximum frame recovery:**
+
 | Metric | iridium-sniffer | gr-iridium |
 |--------|-----------------|------------|
-| Detected bursts | 5468 | N/A |
+| Detected bursts | 5468 | ~3666 |
 | Demodulated RAW frames | 3228 | 2713 |
-| Ok rate | 59% | 74% |
+| Ok rate | 60% | 74% |
 | IDA frames (internal `--parsed`) | 693 | -- |
 | IDA frames (external iridium-parser.py) | 507 | 690 |
 
-Processing speed (60s cf32 file, i7-11800H):
+The default 16 dB threshold detects more bursts than gr-iridium, including weaker signals at the noise floor. Many of these marginal bursts fail demodulation, which lowers the ok percentage -- but the absolute frame count is 19% higher (3228 vs 2713). This is the recommended setting for maximum data recovery.
+
+**Matched threshold (18 dB) -- apples-to-apples comparison:**
+
+| Metric | iridium-sniffer | gr-iridium |
+|--------|-----------------|------------|
+| Detected bursts | 3668 | ~3666 |
+| Demodulated RAW frames | 2559 | 2713 |
+| Ok rate | 70% | 74% |
+| IDA frames (internal `--parsed`) | 576 | -- |
+| IDA frames (external iridium-parser.py) | 464 | 690 |
+
+At 18 dB (gr-iridium's default), burst detection counts are nearly identical. The ok rate gap narrows to 70% vs 74%. The external parser IDA gap (464 vs 690) reflects that gr-iridium's GNU Radio-based demodulator produces cleaner bits -- more frames survive standard BCH correction. Chase soft-decision decoding in `--parsed` mode compensates for this (576 vs 464), but the demodulator quality gap is the area with the most room for improvement. Use `--threshold=18` if ok rate percentage is more important than total frame count.
+
+**Processing speed (60s cf32 file, i7-11800H):**
 
 | Configuration | Wall time | CPU time | Realtime factor |
 |---------------|-----------|----------|-----------------|
@@ -64,7 +80,7 @@ The AVX2 SIMD kernels provide a 1.9x CPU time reduction. GPU acceleration adds s
 
 All configurations produce identical demodulated output (frame count, bit content). GPU vs CPU may differ by a few frames due to floating-point rounding in the burst detection FFT.
 
-The IDA decoder uses Chase BCH soft-decision decoding. Standard BCH corrects up to 2 bit errors per 31-bit block. Chase decoding uses LLR (log-likelihood ratio) confidence from the demodulator to identify the least-reliable bit positions, flips them, and retries BCH correction. This recovers frames with 3+ corrupted positions where the errors cluster around low-confidence symbols. Combined with Gardner timing recovery, this yields 37% more IDA frames than `iridium-parser.py` on the same input (693 vs 507).
+The IDA decoder uses Chase BCH soft-decision decoding. Standard BCH corrects up to 2 bit errors per 31-bit block. Chase decoding uses LLR (log-likelihood ratio) confidence from the demodulator to identify the least-reliable bit positions, flips them, and retries BCH correction. This recovers frames with 3+ corrupted positions where the errors cluster around low-confidence symbols. Combined with Gardner timing recovery, this yields 37% more IDA frames than `iridium-parser.py` on the same input (693 vs 507 at 16 dB threshold).
 
 ## Built-in Web Map (Beta)
 
