@@ -23,4 +23,9 @@ void frame_output_init(const char *file_info);
 /* Print one demodulated frame in iridium-toolkit RAW format to stdout. */
 void frame_output_print(demod_frame_t *frame);
 
+#include "ida_decode.h"
+
+/* Print one decoded IDA burst in iridium-parser.py parsed format to stdout. */
+void frame_output_print_ida(const ida_burst_t *burst);
+
 #endif

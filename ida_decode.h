@@ -19,8 +19,12 @@
 
 /* LCW (Link Control Word) decoded fields */
 typedef struct {
-    int ft;             /* frame type: 2=IDA */
+    int ft;             /* frame type: 0-3 */
     int lcw_ok;         /* all 3 LCW components decoded */
+    int lcw_ft;         /* 2-bit type field from lcw1 */
+    int lcw_code;       /* 4-bit code from lcw2 */
+    uint32_t lcw3_val;  /* 21 data bits from lcw3 */
+    int ec_lcw;         /* total LCW error corrections (-1 if none) */
 } lcw_t;
 
 /* Single IDA burst (after BCH decode, before reassembly) */
@@ -29,12 +33,24 @@ typedef struct {
     double frequency;
     ir_direction_t direction;
     float magnitude;
+    float noise;
+    float level;
+    int confidence;
+    int n_symbols;      /* payload symbols (after UW) */
     int da_ctr;         /* sequence counter 0-7 */
     int da_len;         /* payload length in bytes */
     int cont;           /* continuation expected */
     uint8_t payload[32];
     int payload_len;
     int crc_ok;
+    uint16_t stored_crc;
+    uint16_t computed_crc;
+    int fixederrs;      /* BCH blocks with corrected errors */
+    /* Full BCH-decoded bitstream for parsed output */
+    uint8_t bch_stream[256];
+    int bch_len;
+    lcw_t lcw;
+    char lcw_header[128];   /* formatted LCW(...) string */
 } ida_burst_t;
 
 /* Reassembly slot */

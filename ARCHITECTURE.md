@@ -52,12 +52,17 @@ SDR / IQ File
        |    |  Embedded Leaflet.js + OpenStreetMap map page
        |    |  Mutex-protected shared state (RA circular buffer, sat list)
        |
-       +--→ [IDA Decoder]     -- inline in demod thread (when --gsmtap)
+       +--→ [IDA Decoder]     -- inline in demod thread (when --parsed, --gsmtap)
             |  LCW extraction (46-bit permutation + 3 BCH components)
             |  FT==2 → IDA frame confirmed
+            |  Chase BCH soft-decision decoding (LLR-guided bit flipping)
             |  Payload descramble: 124-bit blocks, de-interleave, BCH(31,20)
             |  CRC-CCITT verification
             |  Multi-burst reassembly (16 slots, freq/time/seq matching)
+            |
+            +--→ [Parsed Output]  -- stdout IDA: lines (when --parsed)
+            |    |  iridium-parser.py compatible format
+            |    |  Currently IDA frames only (IRA/IBC/VOC pass as RAW)
             |
             +--→ [GSMTAP Output]  -- UDP to Wireshark (default 127.0.0.1:4729)
                  |  16-byte GSMTAP header + LAPDm payload
@@ -71,12 +76,12 @@ SDR / IQ File
 | File | Purpose | Lines | Origin |
 |------|---------|-------|--------|
 | `main.c` | Entry point, threading, signal handling | ~450 | New |
-| `options.c` | CLI argument parsing | ~150 | New |
+| `options.c` | CLI argument parsing, format auto-detection from extension | ~180 | New |
 | `iridium.h` | Protocol constants (25 ksps, UW patterns, frame limits) | ~50 | New |
 | `burst_detect.c/h` | FFT burst detector | ~750 | Port of gr-iridium `fft_burst_tagger_impl.cc` |
 | `burst_downmix.c/h` | Per-burst downmix pipeline | ~800 | Port of gr-iridium `burst_downmix_impl.cc` |
 | `qpsk_demod.c/h` | QPSK/DQPSK demodulator | ~250 | Port of gr-iridium `iridium_qpsk_demod_impl.cc` |
-| `frame_output.c/h` | RAW format printer | ~80 | Port of gr-iridium `iridium_frame_printer_impl.cc` |
+| `frame_output.c/h` | RAW + parsed IDA format printer | ~260 | Port of gr-iridium `iridium_frame_printer_impl.cc` + new |
 | `frame_decode.c/h` | Iridium frame decoder (BCH, de-interleave, IRA/IBC) | ~450 | New (based on iridium-toolkit bitsparser.py) |
 | `ida_decode.c/h` | IDA frame decoder (LCW, descramble, BCH, reassembly) | ~450 | New (based on iridium-toolkit bitsparser.py + ida.py) |
 | `gsmtap.c/h` | GSMTAP/LAPDm UDP output for Wireshark | ~100 | New |
@@ -110,7 +115,7 @@ SDR / IQ File
 | Burst pre-length | 16384 samples | `2 * fft_size` |
 | Burst post-length | 160000 samples | `samp_rate * 16 ms` |
 | Max burst length | 900000 samples | `samp_rate * 90 ms` |
-| Threshold | 18.0 dB | Default, configurable via `-d` |
+| Threshold | 16.0 dB | Default, configurable via `-d` |
 | Noise history | 512 FFT frames | Adaptive baseline |
 | Output sample rate | 250000 Hz | `10 sps * 25000 sym/s` |
 | Symbols per second | 25000 | Iridium DQPSK |
@@ -134,11 +139,11 @@ This format is consumed directly by [iridium-toolkit](https://github.com/muccc/i
 
 **Why a single burst detector thread?** The FFT burst detector maintains sequential state: noise floor history, active burst list, ring buffer. Parallelizing it would require complex synchronization with no benefit since FFT computation dominates and is already vectorized.
 
-**Why separate downmix workers?** Each burst is independent. The downmix is the most CPU-intensive stage (multiple FFTs per burst). 2 worker threads provide good throughput without excessive contention.
+**Why separate downmix workers?** Each burst is independent. The downmix is the most CPU-intensive stage (multiple FFTs per burst). 4 worker threads provide good throughput without excessive contention.
 
 **Why single demod+output thread?** QPSK demod is cheap (no FFTs). Output must be serialized for stdout. Combining them in one thread avoids an extra queue and keeps the design simple.
 
-**FFTW thread safety:** FFTW plan creation is not thread-safe even with `FFTW_ESTIMATE`. All `fftwf_plan_*` and `fftwf_destroy_plan` calls are wrapped with a global mutex (`fftw_lock.h`). Plans use `FFTW_MEASURE` for optimal runtime performance. This is different from GNU Radio where plans are created on the main thread before the flowgraph starts.
+**FFTW thread safety:** FFTW plan creation is not thread-safe even with `FFTW_ESTIMATE`. All `fftwf_plan_*` and `fftwf_destroy_plan` calls are wrapped with a global mutex (`fftw_lock.h`). Per-burst plans use `FFTW_MEASURE` for optimal runtime performance. The one-time sync word template FFTs use `FFTW_ESTIMATE` (these run exactly twice at startup, so planning overhead has zero benefit).
 
 ## Build
 
@@ -205,14 +210,17 @@ All three produce equivalent RAW output (2500-2577 lines). Minor variations are 
 ## Usage
 
 ```bash
-# From IQ file (int8 format)
-./iridium-sniffer -f recording.raw
+# From IQ file (format auto-detected from extension)
+./iridium-sniffer -f recording.cf32
 
 # Live capture with SoapySDR
 ./iridium-sniffer -l -i soapy-0
 
 # Pipe to iridium-toolkit
-./iridium-sniffer -f recording.raw | python3 iridium-parser.py
+./iridium-sniffer -f recording.cf32 | python3 iridium-parser.py
+
+# Parsed IDA output (bypasses iridium-parser.py for IDA/ACARS/SBD)
+./iridium-sniffer -f recording.cf32 --parsed | python3 reassembler.py -m acars
 ```
 
 ## Implementation Status
@@ -660,17 +668,18 @@ Profiling the CPU-intensive DSP pipeline revealed that FIR filtering, magnitude 
 
 | Configuration | CPU Time (user) | Wall Time | Speedup | RAW Lines | MD5 (sorted) |
 |---------------|-----------------|-----------|---------|-----------|--------------|
-| Baseline (pre-SIMD) | 29.0s | 10.0s | 1.0x | 2577 | 681faca7... |
-| AVX2+FMA | 16.3s | 10.0s | **1.78x** | 2577 | (different)* |
-| `--no-simd` | 29.2s | 10.0s | 1.0x | 2577 | 681faca7... |
+| AVX2 + GPU | 23.6s | 15.1s | **1.9x** (CPU) | 3228 | c09b29ce... |
+| AVX2 only | 21.5s | 12.0s | **1.9x** (CPU) | 3228 | 510e8cc9... |
+| Scalar + GPU | 42.6s | 16.1s | 1.0x | 3228 | c09b29ce... |
+| Scalar only | 40.6s | 13.0s | 1.0x | 3228 | 510e8cc9... |
 
-\* Sorted decoded bits are byte-for-byte identical. Output line order differs due to FMA rounding affecting floating-point intermediate values (center frequency, timestamps), which changes thread scheduling in the multi-threaded burst queue. This is expected and correct.
+AVX2 vs scalar produces identical decoded bits (same frames, same demodulated data). GPU vs CPU may differ by a few frames due to burst detection FFT rounding, hence two MD5 groups.
 
 **Verification:**
-- Decoded bits: Identical when sorted (same 2577 frames, same demodulated data)
-- `--no-simd` produces identical MD5 to baseline (proves scalar path is unchanged)
-- Wall-clock stayed ~10s because 4.5 GB file read is I/O bound
-- CPU time reduced 44% (29.0s → 16.3s) at same decode quality
+- AVX2 and scalar produce identical output within each GPU group
+- 60s file processed in 12-15s = 4-5x realtime
+- CPU time reduced 47% with AVX2 (40.6s -> 21.5s) at identical decode quality
+- GPU adds ~3s startup overhead for OpenCL init; not beneficial at 10 MHz on fast x86
 
 ### Files Modified
 
@@ -706,22 +715,20 @@ Profiling the CPU-intensive DSP pipeline revealed that FIR filtering, magnitude 
 
 ## Detection Threshold Optimization (Phase 14)
 
-Comparative analysis against gr-iridium revealed that the original 18 dB threshold was conservative. Testing on a 60-second USRP B210 capture (10 MHz, 1622 MHz center) with thresholds from 15-18 dB:
+Comparative analysis against gr-iridium revealed that the original 18 dB threshold was conservative. The 16 dB threshold recovers marginal signals (low-elevation satellites, fading) without introducing false positives.
 
-| Threshold | Total RAW | Valid Parsed | CPU Time | vs gr-iridium |
-|-----------|-----------|--------------|----------|---------------|
-| 18 dB (original) | 2577 | 665 | 16.5s | -5% frames |
-| 17 dB | 2957 | 693 | 19.1s | +4.2% frames |
-| **16 dB (new default)** | **3252** | **709** | **21.9s** | **+6.6% frames** |
-| 15 dB | 3450 | 711 | 25.3s | +6.9% frames |
+Current results (60-second USRP B210 capture, 10 MHz, 1622 MHz center):
 
-The 16 dB threshold provides the best balance:
-- **465 unique valid frames** vs gr-iridium's 435 (+6.9% total, +85% more unique detections)
-- All additional frames parse successfully through iridium-toolkit (no false positives)
-- Still 2.7x faster than realtime (21.9s CPU for 60s IQ)
-- Recovers marginal signals (low-elevation satellites, fading) without noise
+| Metric | iridium-sniffer (16 dB) | gr-iridium |
+|--------|------------------------|------------|
+| Detected bursts | 5468 | N/A |
+| Demodulated RAW frames | 3228 | 2713 |
+| IDA frames (--parsed) | 693 | -- |
+| IDA frames (external parser) | 507 | 690 |
 
-The threshold is relative to the adaptive noise floor, so it works equally well in clean and noisy environments. The 33% CPU increase (16.5s → 21.9s) is acceptable given the performance margin and decode rate improvement.
+The internal `--parsed` IDA decoder recovers 37% more IDA frames than the external iridium-parser.py (693 vs 507) thanks to Chase soft-decision BCH decoding and Gardner timing recovery.
+
+The threshold is relative to the adaptive noise floor, so it works equally well in clean and noisy environments.
 
 ## Known Issues
 

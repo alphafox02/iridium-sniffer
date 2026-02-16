@@ -72,6 +72,7 @@ extern char *gsmtap_host;
 extern int gsmtap_port;
 extern int diagnostic_mode;
 extern int use_gardner;
+extern int parsed_mode;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -116,7 +117,8 @@ static void usage(int exitcode) {
 "    --file-info=STR         file info string for output (default: auto)\n"
 "    --save-bursts=DIR       save IQ samples of decoded bursts to directory\n"
 "    --diagnostic            setup verification mode (suppresses RAW output)\n"
-"    --gardner              use Gardner timing recovery (improves weak bursts)\n"
+"    --no-gardner           disable Gardner timing recovery (enabled by default)\n"
+"    --parsed               output parsed IDA lines (pipe to reassembler.py)\n"
 "    -v, --verbose           verbose output to stderr\n"
 "    -h, --help              show this help\n"
 "    --list                  list available SDR interfaces\n"
@@ -145,6 +147,8 @@ static void list_interfaces(void) {
 
 void parse_options(int argc, char **argv) {
     int ch;
+    int format_explicit = 0;
+    const char *in_filename = NULL;
 
     enum {
         OPT_HACKRF_LNA = 0x100,
@@ -163,6 +167,8 @@ void parse_options(int argc, char **argv) {
         OPT_SAVE_BURSTS,
         OPT_DIAGNOSTIC,
         OPT_GARDNER,
+        OPT_NO_GARDNER,
+        OPT_PARSED,
     };
 
     static const struct option longopts[] = {
@@ -191,6 +197,8 @@ void parse_options(int argc, char **argv) {
         { "save-bursts",    required_argument, NULL, OPT_SAVE_BURSTS },
         { "diagnostic",     no_argument,       NULL, OPT_DIAGNOSTIC },
         { "gardner",        no_argument,       NULL, OPT_GARDNER },
+        { "no-gardner",     no_argument,       NULL, OPT_NO_GARDNER },
+        { "parsed",         no_argument,       NULL, OPT_PARSED },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -200,6 +208,7 @@ void parse_options(int argc, char **argv) {
                 in_file = fopen(optarg, "rb");
                 if (in_file == NULL)
                     err(1, "Cannot open input file '%s'", optarg);
+                in_filename = optarg;
                 break;
 
             case 'l':
@@ -259,6 +268,7 @@ void parse_options(int argc, char **argv) {
                 break;
 
             case OPT_FORMAT:
+                format_explicit = 1;
                 if (strcmp(optarg, "ci8") == 0)
                     iq_format = FMT_CI8;
                 else if (strcmp(optarg, "ci16") == 0)
@@ -312,6 +322,14 @@ void parse_options(int argc, char **argv) {
                 use_gardner = 1;
                 break;
 
+            case OPT_NO_GARDNER:
+                use_gardner = 0;
+                break;
+
+            case OPT_PARSED:
+                parsed_mode = 1;
+                break;
+
             case 'h':
                 usage(0);
                 break;
@@ -328,6 +346,20 @@ void parse_options(int argc, char **argv) {
 
     if (live && in_file != NULL)
         errx(1, "Cannot use both --live and --file");
+
+    /* Auto-detect format from file extension if not explicitly specified */
+    if (in_filename && !format_explicit) {
+        const char *ext = strrchr(in_filename, '.');
+        if (ext) {
+            if (strcmp(ext, ".cf32") == 0 || strcmp(ext, ".fc32") == 0 ||
+                strcmp(ext, ".cfile") == 0)
+                iq_format = FMT_CF32;
+            else if (strcmp(ext, ".ci16") == 0 || strcmp(ext, ".cs16") == 0 ||
+                     strcmp(ext, ".sc16") == 0)
+                iq_format = FMT_CI16;
+            /* .ci8 and other extensions keep the ci8 default */
+        }
+    }
 
     if (samp_rate <= 0)
         errx(1, "Invalid sample rate: %.0f", samp_rate);

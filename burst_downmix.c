@@ -205,9 +205,10 @@ static void generate_sync_word(burst_downmix_t *dm, const int *uw, int uw_len,
     fftw_lock();
     fftwf_plan plan = fftwf_plan_dft_1d(dm->corr_fft_size,
                                          sync_fft_in, sync_fft_result,
-                                         FFTW_FORWARD, FFTW_MEASURE);
+                                         FFTW_FORWARD, FFTW_ESTIMATE);
     fftw_unlock();
     fftwf_execute(plan);
+
     fftw_lock();
     fftwf_destroy_plan(plan);
     fftw_unlock();
@@ -323,8 +324,8 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
     int sync_search_symbols = IR_PREAMBLE_LENGTH_LONG + IR_UW_LENGTH + 8;
     dm->sync_search_len = (int)(sync_search_symbols * dm->samples_per_symbol);
 
-    /* Need sync word length to determine corr FFT size. Use UL (longer). */
-    int ul_sync_symbols = 32 + IR_UW_LENGTH; /* UL preamble=32 */
+    /* Need sync word length to determine corr FFT size. */
+    int ul_sync_symbols = IR_PREAMBLE_LENGTH_SHORT + IR_UW_LENGTH;
     int ul_sync_samples = (int)(ul_sync_symbols * dm->samples_per_symbol);
     dm->corr_fft_size = next_pow2(dm->sync_search_len + ul_sync_samples);
 
@@ -358,7 +359,7 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
                        IR_PREAMBLE_LENGTH_SHORT, 0,
                        &dm->dl_sync_fft, &dm->dl_sync_len);
     generate_sync_word(dm, IR_UW_UL, IR_UW_LENGTH,
-                       32, 1,  /* UL preamble = 32 symbols */
+                       IR_PREAMBLE_LENGTH_SHORT, 1,
                        &dm->ul_sync_fft, &dm->ul_sync_len);
 
     /* ---- Working buffers (generous size, aligned for SIMD) ---- */
@@ -678,13 +679,19 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
         return 0;
     }
 
-    /* Step 2b: Noise-limiting filter (20 kHz cutoff, removes out-of-band noise) */
+    /* Step 2b: Noise-limiting LPF */
     {
-        int noise_ntaps = dm->noise_fir->ntaps;
-        int filtered_len = dec_len - noise_ntaps + 1;
-        if (filtered_len > 100) {
-            fir_filter_ccf(dm->noise_fir, dm->work_a, dm->work_b, filtered_len);
-            dec_len = filtered_len;
+        int nlpf_len = dec_len - dm->noise_fir->ntaps + 1;
+        if (nlpf_len > 0) {
+            int half_noise = (dm->noise_fir->ntaps - 1) / 2;
+            /* Pad for centered convolution */
+            int pad_len = dec_len + dm->noise_fir->ntaps - 1;
+            if (pad_len > dm->work_size) pad_len = dm->work_size;
+            memset(dm->work_a, 0, pad_len * sizeof(float complex));
+            memcpy(&dm->work_a[half_noise], dm->work_b,
+                   dec_len * sizeof(float complex));
+            fir_filter_ccf(dm->noise_fir, dm->work_b, dm->work_a, dec_len);
+            memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
         } else {
             memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
         }

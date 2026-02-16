@@ -12,12 +12,15 @@ Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames direct
 
 - Full Iridium L-band burst detection, downmix, and DQPSK demodulation pipeline
 - Direct iridium-toolkit RAW output, compatible with iridium-parser.py and reassembler.py
+- Parsed IDA output mode (`--parsed`) for direct reassembler.py piping (ACARS/SBD recovery)
+- Chase BCH soft-decision decoding recovers 37% more IDA frames than iridium-parser.py
+- Gardner timing recovery (enabled by default) for improved weak burst demodulation
 - Native GSMTAP/LAPDm output to Wireshark (`--gsmtap`) for IDA frame analysis
 - Built-in web map with live satellite and ring alert visualization
 - GPU-accelerated FFT burst detection (OpenCL or Vulkan)
 - Multi-threaded architecture: detection, downmix pool, demodulation, stats
 - HackRF, BladeRF, USRP, and SoapySDR support
-- Reads ci8, ci16, and cf32 IQ file formats
+- Reads ci8, ci16, and cf32 IQ files with auto-detection from file extension
 
 ## Quick Start
 
@@ -38,18 +41,30 @@ make -j$(nproc)
 
 ## Performance
 
-Tested against gr-iridium on a 60-second IQ recording at 10 MHz from a USRP B210:
+Tested against gr-iridium on a 60-second IQ recording (cf32, 10 MHz, 1622 MHz center, USRP B210):
 
 | Metric | iridium-sniffer | gr-iridium |
 |--------|-----------------|------------|
-| Total RAW frames | 3252 | 2713 |
-| Valid parsed frames | 709 | 665 |
-| Unique valid frames | 465 | 435 |
-| CPU time (60s IQ) | 21.9s | N/A |
+| Detected bursts | 5468 | N/A |
+| Demodulated RAW frames | 3228 | 2713 |
+| Ok rate | 59% | 74% |
+| IDA frames (internal `--parsed`) | 693 | -- |
+| IDA frames (external iridium-parser.py) | 507 | 690 |
 
-iridium-sniffer decodes 6.6% more valid frames than gr-iridium while processing 2.7x faster than realtime. The default 16 dB detection threshold is tuned to recover marginal signals (low-elevation satellites, fading) without introducing false positives. In live capture, iridium-sniffer produces roughly twice as many decoded frames per second as gr-iridium.
+Processing speed (60s cf32 file, i7-11800H):
 
-The frame decoder implements BCH(31,21) error correction with two-bit correction capability, three-way and two-way de-interleaving, and field extraction for IRA (satellite position, beam, paging TMSIs) and IBC (satellite ID, beam, Iridium time counter) frames. From a 60-second recording, it typically decodes 150+ ring alerts and 250+ broadcast frames across 50-60 unique satellites.
+| Configuration | Wall time | CPU time | Realtime factor |
+|---------------|-----------|----------|-----------------|
+| AVX2 + GPU | 15.1s | 23.6s | 4.0x |
+| AVX2 only | 12.0s | 21.5s | 5.0x |
+| Scalar + GPU | 16.1s | 42.6s | 3.7x |
+| Scalar only (baseline) | 13.0s | 40.6s | 4.6x |
+
+The AVX2 SIMD kernels provide a 1.9x CPU time reduction. GPU acceleration adds startup overhead for files this size but becomes beneficial for longer recordings and continuous live capture.
+
+All configurations produce identical demodulated output (frame count, bit content). GPU vs CPU may differ by a few frames due to floating-point rounding in the burst detection FFT.
+
+The IDA decoder uses Chase BCH soft-decision decoding. Standard BCH corrects up to 2 bit errors per 31-bit block. Chase decoding uses LLR (log-likelihood ratio) confidence from the demodulator to identify the least-reliable bit positions, flips them, and retries BCH correction. This recovers frames with 3+ corrupted positions where the errors cluster around low-confidence symbols. Combined with Gardner timing recovery, this yields 37% more IDA frames than `iridium-parser.py` on the same input (693 vs 507).
 
 ## Built-in Web Map (Beta)
 
@@ -122,6 +137,34 @@ The IDA decoder implements:
 - Multi-burst reassembly (16 concurrent slots, frequency/time/sequence matching)
 
 GSMTAP runs alongside normal RAW output and the web map. Adding `--gsmtap` does not change stdout.
+
+## Parsed IDA Output
+
+The `--parsed` flag enables internal IDA frame decoding with Chase BCH error correction and outputs parsed IDA lines directly to stdout. This was added primarily for recovering ACARS, SBD, and other IDA-based message content without requiring the external Python `iridium-parser.py` pipeline.
+
+```bash
+# Direct to reassembler (no iridium-parser.py needed for IDA/ACARS/SBD)
+./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+
+# Traditional pipeline (still works, decodes all frame types)
+./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
+```
+
+**Current capabilities and limitations:**
+
+`--parsed` currently decodes **IDA frames only**. These are the data-carrying frames used for ACARS, SBD messaging, voice call setup, and other payload traffic. IDA is what the reassembler needs for message reconstruction.
+
+Frame types **not yet decoded** by `--parsed` (these pass through as `RAW:` lines):
+- IRA (ring alerts) -- satellite position and paging events
+- IBC (broadcast channel) -- satellite ID, beam, Iridium time
+- VOC/VOZ (voice) -- voice codec frames
+- ISY, ITL, IIU, IMS, and other signaling types
+
+For IRA and IBC, the `--web` map feature already decodes these frame types independently using a separate decoder. The `--parsed` limitation only affects stdout text output.
+
+If all frame types are needed on stdout (not just IDA), use the traditional pipeline: `iridium-sniffer | iridium-parser.py`. The internal IDA decoder produces 37% more IDA frames than the external parser thanks to Chase soft-decision BCH decoding, but the external parser handles all frame types.
+
+In parsed mode, decoded IDA frames appear as `IDA:` lines with fields matching `iridium-parser.py` output format. Non-IDA frames continue to appear as `RAW:` lines. The `--parsed` flag adds no measurable overhead.
 
 ## Burst IQ Capture
 
@@ -235,15 +278,20 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 
 ### File Input
 
+The IQ format is auto-detected from the file extension (`.cf32`/`.fc32`/`.cfile` for cf32, `.ci16`/`.cs16`/`.sc16` for ci16). Files with unrecognized extensions default to ci8. Use `--format` to override.
+
 ```bash
-# int8 IQ (default)
-./iridium-sniffer -f recording.raw
+# Auto-detected as cf32 from extension
+./iridium-sniffer -f recording.cf32
 
-# Complex float32
-./iridium-sniffer -f recording.cf32 --format cf32
+# Auto-detected as ci16
+./iridium-sniffer -f recording.cs16
 
-# Complex int16 with custom sample rate
-./iridium-sniffer -f recording.ci16 --format ci16 -r 10000000 -c 1622000000
+# Explicit format override (e.g., .raw file that is actually cf32)
+./iridium-sniffer -f recording.raw --format cf32
+
+# Custom sample rate and center frequency
+./iridium-sniffer -f recording.cf32 -r 10000000 -c 1622000000
 ```
 
 ### Live Capture
@@ -269,7 +317,10 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 # Real-time decode
 ./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py
 
-# File processing with full reassembly
+# Direct to reassembler (parsed mode, bypasses iridium-parser.py)
+./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+
+# File processing with full reassembly (traditional pipeline)
 ./iridium-sniffer -f recording.cf32 --format cf32 | \
     python3 iridium-toolkit/iridium-parser.py | \
     python3 iridium-toolkit/reassembler.py
@@ -290,6 +341,7 @@ Input (one required):
     -f, --file=FILE         read IQ samples from file
     -l, --live              capture live from SDR
     --format=FMT            IQ file format: ci8 (default), ci16, cf32
+                             Auto-detected from file extension when not specified
 
 SDR options:
     -i, --interface=IFACE   SDR to use (hackrf-SERIAL, bladerf0, usrp-PROD-SERIAL, soapy-N)
@@ -306,7 +358,7 @@ Gain options:
     --soapy-gain=GAIN       SoapySDR gain in dB (default: 40)
 
 Detection:
-    -d, --threshold=DB      burst detection threshold in dB (default: 18.0)
+    -d, --threshold=DB      burst detection threshold in dB (default: 16.0)
     --no-gpu                disable GPU acceleration (use CPU FFTW)
 
 Web map:
@@ -318,6 +370,11 @@ GSMTAP:
 
 Output:
     --file-info=STR         file info string for RAW output (default: auto)
+    --parsed                output parsed IDA lines (bypass iridium-parser.py)
+    --save-bursts=DIR       save IQ samples of decoded bursts to directory
+    --diagnostic            setup verification mode (suppresses RAW output)
+    --no-gardner            disable Gardner timing recovery (enabled by default)
+    --no-simd               disable AVX2/FMA SIMD acceleration
     -v, --verbose           verbose output to stderr
     -h, --help              show this help
     --list                  list available SDR interfaces

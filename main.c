@@ -111,7 +111,8 @@ int use_gpu = 0;
 int no_simd = 0;
 char *save_bursts_dir = NULL;
 int diagnostic_mode = 0;
-int use_gardner = 0;
+int use_gardner = 1;
+int parsed_mode = 0;
 
 /* Threading state */
 volatile sig_atomic_t running = 1;
@@ -264,7 +265,18 @@ static void *frame_consumer_thread(void *arg) {
         if (qpsk_demod(frame, &demod)) {
             atomic_fetch_add(&stat_n_ok_bursts, 1);
             atomic_fetch_add(&stat_n_ok_sub, 1);
-            frame_output_print(demod);
+
+            /* Try IDA decode if parsed output or GSMTAP is active */
+            int ida_ok = 0;
+            ida_burst_t burst;
+            if (parsed_mode || gsmtap_enabled)
+                ida_ok = ida_decode(demod, &burst);
+
+            /* Output: parsed IDA line if available, otherwise RAW */
+            if (parsed_mode && ida_ok)
+                frame_output_print_ida(&burst);
+            else
+                frame_output_print(demod);
 
             if (web_enabled) {
                 decoded_frame_t decoded;
@@ -278,8 +290,7 @@ static void *frame_consumer_thread(void *arg) {
             }
 
             if (gsmtap_enabled) {
-                ida_burst_t burst;
-                if (ida_decode(demod, &burst))
+                if (ida_ok)
                     ida_reassemble(&ida_ctx, &burst, gsmtap_ida_cb, NULL);
                 ida_reassemble_flush(&ida_ctx, demod->timestamp);
             }
@@ -482,13 +493,15 @@ int main(int argc, char **argv) {
     if (web_enabled || gsmtap_enabled)
         frame_decode_init();
 
+    if (parsed_mode || gsmtap_enabled)
+        ida_decode_init();
+
     if (web_enabled) {
         if (web_map_init(web_port) != 0)
             errx(1, "Failed to start web map server on port %d", web_port);
     }
 
     if (gsmtap_enabled) {
-        ida_decode_init();
         if (gsmtap_init(gsmtap_host, gsmtap_port) != 0)
             errx(1, "Failed to initialize GSMTAP socket");
     }
