@@ -439,6 +439,11 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
             float min_err = (dl_err < ul_err) ? dl_err : ul_err;
 
             if (min_err > UW_SOFT_THRESHOLD) {
+                /* Save failed burst IQ if requested (for demod analysis) */
+                if (save_bursts_dir) {
+                    in->direction = DIR_UNDEF;
+                    save_burst_iq(in, save_bursts_dir);
+                }
                 free(decimated);
                 free(pll_out);
                 free(symbols);

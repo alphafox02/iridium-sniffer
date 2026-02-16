@@ -530,7 +530,16 @@ static void extract_peaks(burst_detector_t *d) {
     d->num_peaks = 0;
     int half_bw = d->burst_width / 2;
 
+    /* DC notch: skip bins near center frequency to reject LO leakage / ADC
+     * offset spikes.  Width of 3 bins (~3.7 kHz at 10 MHz / 8192-pt FFT)
+     * covers typical SDR DC spikes without losing any real Iridium signal
+     * (channels are 41.667 kHz wide and never centered at DC). */
+    int dc_bin = d->fft_size / 2;
+    int dc_notch_half = 3;  /* ±3 bins around DC */
+
     for (int bin = half_bw; bin < d->fft_size - half_bw; bin++) {
+        if (bin >= dc_bin - dc_notch_half && bin <= dc_bin + dc_notch_half)
+            continue;
         if (d->relative_magnitude[bin] > d->threshold) {
             d->peaks[d->num_peaks].bin = bin;
             d->peaks[d->num_peaks].relative_magnitude = d->relative_magnitude[bin];
