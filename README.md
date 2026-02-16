@@ -2,7 +2,7 @@
 
 A standalone Iridium satellite burst detector and demodulator written in C. It provides an alternative to [gr-iridium](https://github.com/muccc/gr-iridium) by eliminating the GNU Radio dependency, while producing the same [iridium-toolkit](https://github.com/muccc/iridium-toolkit) compatible RAW output on stdout. For users who want a lighter-weight, dependency-free option or need embedded deployment, this offers similar functionality with a different architectural approach.
 
-Supports HackRF, BladeRF, USRP (UHD), and SoapySDR for live capture, or processes IQ recordings from file. Optional GPU-accelerated burst detection is available via OpenCL or Vulkan, including on the Raspberry Pi 5.
+Supports HackRF, BladeRF, USRP (UHD), and SoapySDR for live capture, or processes IQ recordings from file. Optional GPU-accelerated burst detection is available via OpenCL (NVIDIA, AMD, Intel). Runs on Raspberry Pi 5 and other ARM boards in CPU-only mode with FFTW wisdom pre-generation.
 
 A built-in web map (`--web`, beta) provides a real-time Leaflet.js visualization of decoded ring alert positions and active satellites -- no external tools or Python required.
 
@@ -22,21 +22,122 @@ Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames direct
 - HackRF, BladeRF, USRP, and SoapySDR support
 - Reads ci8, ci16, and cf32 IQ files with auto-detection from file extension
 
-## Quick Start
+## Installation
+
+### DragonOS Noble
+
+DragonOS Noble ships with HackRF, BladeRF, USRP (UHD), SoapySDR, and OpenCL drivers pre-installed. Just clone and build:
 
 ```bash
-# Install dependencies (Debian/Ubuntu)
-sudo apt install build-essential cmake libfftw3-dev libhackrf-dev
-
-# Build
+git clone https://github.com/alphafox02/iridium-sniffer.git
+cd iridium-sniffer
 mkdir build && cd build
 cmake ..
 make -j$(nproc)
+```
 
-# Live capture with web map
+CMake auto-detects the available SDR libraries and GPU support. All SDR backends and OpenCL GPU acceleration should be enabled automatically.
+
+### Ubuntu / Debian
+
+```bash
+git clone https://github.com/alphafox02/iridium-sniffer.git
+cd iridium-sniffer
+
+# Core dependencies
+sudo apt install build-essential cmake libfftw3-dev
+
+# SDR libraries (install only what you have)
+sudo apt install libhackrf-dev      # HackRF One
+sudo apt install libbladerf-dev     # BladeRF
+sudo apt install libuhd-dev         # USRP (B2x0, N2x0, X3x0, etc.)
+sudo apt install libsoapysdr-dev    # RTL-SDR, Airspy, LimeSDR, etc. via SoapySDR
+
+# Optional: GPU-accelerated burst detection
+sudo apt install ocl-icd-opencl-dev  # OpenCL (NVIDIA, AMD, Intel)
+
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+```
+
+CMake output shows what was detected:
+
+```
+-- HackRF: enabled
+-- BladeRF: enabled
+-- USRP (UHD): enabled
+-- SoapySDR: enabled
+-- GPU acceleration: OpenCL
+```
+
+### Raspberry Pi 5 / ARM
+
+The Pi 5's VideoCore VII GPU passes basic Vulkan compute tests but cannot sustain the throughput needed for real-time FFT batch processing. Build CPU-only and use `--no-gpu`:
+
+```bash
+git clone https://github.com/alphafox02/iridium-sniffer.git
+cd iridium-sniffer
+sudo apt install build-essential cmake libfftw3-dev libsoapysdr-dev
+
+mkdir build && cd build
+cmake .. -DUSE_OPENCL=OFF
+make -j$(nproc)
+```
+
+**FFTW wisdom (important for ARM):** FFTW uses `FFTW_MEASURE` to benchmark FFT algorithms at plan creation time. On x86 this is fast and unnoticeable. On ARM it can block for 30-60+ seconds per plan, causing `q_max` to climb during live capture as samples queue up while plans are being built.
+
+Pre-generate a wisdom file to avoid this. iridium-sniffer automatically loads wisdom from `~/.iridium-sniffer-fftw-wisdom` at startup and saves updated wisdom on shutdown. After the first successful run (or the command below), subsequent starts are immediate.
+
+The required wisdom entries depend on sample rate. The burst detection FFT size varies, while the downmix FFTs are always the same (cof4096 for CFO estimation, cof2048/cob2048 for correlation):
+
+| Sample Rate | Burst FFT | Wisdom Command |
+|-------------|-----------|----------------|
+| 2-2.4 MHz (RTL-SDR) | 2048 | `fftwf-wisdom -v -o ~/.iridium-sniffer-fftw-wisdom cof2048 cof4096 cob2048` |
+| 6 MHz (Airspy Mini) | 8192 | `fftwf-wisdom -v -o ~/.iridium-sniffer-fftw-wisdom cof8192 cof4096 cof2048 cob2048` |
+| 10 MHz (default) | 8192 | `fftwf-wisdom -v -o ~/.iridium-sniffer-fftw-wisdom cof8192 cof4096 cof2048 cob2048` |
+| 20 MHz (HackRF, USRP) | 16384 | `fftwf-wisdom -v -o ~/.iridium-sniffer-fftw-wisdom cof16384 cof4096 cof2048 cob2048` |
+
+The naming convention: `cof` = complex forward, `cob` = complex backward, followed by the FFT size. If running multiple sample rates on the same system, include all burst FFT sizes in one command (e.g., `cof2048 cof8192 cof4096 cob2048`). The "system-wisdom import failed" warning from `fftwf-wisdom` is normal on a fresh system and can be ignored.
+
+GNU Radio manages FFTW wisdom automatically (in `~/.gr_fftw_wisdom`), which is why gr-iridium users never encounter this issue. Since iridium-sniffer replaces the GNU Radio dependency, it handles wisdom directly.
+
+### Build Variants
+
+```bash
+# OpenCL GPU (default when available)
+cmake .. -DUSE_OPENCL=ON
+
+# Vulkan GPU
+cmake .. -DUSE_VULKAN=ON -DUSE_OPENCL=OFF
+
+# CPU only
+cmake .. -DUSE_OPENCL=OFF
+
+# Debug build with AddressSanitizer
+cmake .. -DCMAKE_BUILD_TYPE=Debug
+```
+
+## Quick Start
+
+```bash
+# Live capture (auto-detect SDR)
+./iridium-sniffer -l
+
+# Live capture with web map (open http://localhost:8888)
 ./iridium-sniffer -l --web
 
-# Open http://localhost:8888 in a browser
+# Process an IQ recording
+./iridium-sniffer -f recording.cf32
+
+# Pipe to iridium-toolkit
+./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py
+
+# Direct ACARS/SBD recovery (bypasses iridium-parser.py)
+./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+
+# Send IDA frames to Wireshark
+./iridium-sniffer -l --gsmtap
 ```
 
 ## Performance
@@ -207,89 +308,6 @@ The `--save-bursts` option saves IQ samples from successfully decoded bursts to 
 
 Captured IQ is at 250 kHz sample rate, 10 samples per symbol, after RRC matched filtering. Each file contains one complete burst ready for demodulation.
 
-## Dependencies
-
-**Note for DragonOS users:** Most dependencies listed below are pre-installed in DragonOS Noble. You may only need to install GPU support libraries (OpenCL/Vulkan) if desired.
-
-### Minimal Build (CPU-only, file processing)
-
-For processing IQ recordings without SDR or GPU support:
-
-```bash
-sudo apt install build-essential cmake libfftw3-dev
-```
-
-This builds a CPU-only binary that reads files but cannot capture from SDRs or use GPU acceleration.
-
-### Standard Build (CPU + SDR)
-
-Add at least one SDR backend for live capture:
-
-```bash
-# Start with minimal build, then add SDR libraries:
-sudo apt install libhackrf-dev     # HackRF One
-sudo apt install libbladerf-dev    # BladeRF
-sudo apt install libuhd-dev        # USRP (B2x0, N2x0, X3x0, etc.)
-sudo apt install libsoapysdr-dev   # SoapySDR (RTL-SDR, Airspy, LimeSDR, etc.)
-```
-
-Install only the libraries for SDRs you own. CMake auto-detects what's available.
-
-### GPU-Accelerated Build
-
-For GPU-accelerated burst detection on desktop/laptop:
-
-```bash
-# Standard build + OpenCL (NVIDIA, AMD, Intel)
-sudo apt install ocl-icd-opencl-dev
-```
-
-### Raspberry Pi 5 Build
-
-Pi 5 has no OpenCL support, use Vulkan instead:
-
-```bash
-# Minimal build + Vulkan (VideoCore VII GPU)
-sudo apt install libvulkan-dev glslang-dev spirv-tools
-
-# Plus SoapySDR for RTL-SDR/Airspy/etc.
-sudo apt install libsoapysdr-dev
-```
-
-## Build
-
-```bash
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-```
-
-CMake auto-detects available SDR libraries and GPU support. The output tells you what it found:
-
-```
--- HackRF: enabled
--- BladeRF: enabled
--- USRP (UHD): enabled
--- SoapySDR: enabled
--- GPU acceleration: OpenCL
-```
-
-### Build Variants
-
-```bash
-# OpenCL GPU (default when available)
-cmake .. -DUSE_OPENCL=ON
-
-# Vulkan GPU (required for Raspberry Pi 5)
-cmake .. -DUSE_VULKAN=ON -DUSE_OPENCL=OFF
-
-# CPU only
-cmake .. -DUSE_OPENCL=OFF
-
-# Debug build with AddressSanitizer
-cmake .. -DCMAKE_BUILD_TYPE=Debug
-```
-
 ## Usage
 
 ### File Input
@@ -407,6 +425,8 @@ Below 1617.775 MHz is Globalstar's exclusive territory. The ITU allocation exten
 
 **Sample rate:** 10 MHz (default) covers the full authorized Iridium band without processing empty spectrum. SDRs with 12 MHz capability can use `-r 12000000 -c 1621000000` to cover the entire ITU allocation including the unauthorized guard band, but this provides no additional Iridium signals.
 
+**Narrowband SDRs (RTL-SDR):** For RTL-SDR and other SDRs limited to 2-3 MHz bandwidth, use `-c 1625500000 -r 2400000` to center on the ring alert and simplex channels (1624.3-1626.7 MHz). This captures the IRA frames needed for the web map. The default 1622 MHz center is optimized for wideband receivers and places ring alert channels outside narrowband capture range.
+
 **Threshold:** 16 dB (default) balances sensitivity and false positives. Lower values (14 dB) catch weaker bursts at the cost of more noise. Higher values (18-20 dB) are more selective but may miss marginal signals.
 
 ## SDR Hardware
@@ -429,11 +449,11 @@ GPU acceleration offloads the burst detection FFT to the GPU. The rest of the si
 |----------|---------|-------|
 | NVIDIA | OpenCL | Full GPU pipeline, best performance |
 | AMD | OpenCL | ROCm or Mesa drivers |
-| Raspberry Pi 5 | Vulkan | Only GPU API available on VideoCore VII |
 | Intel integrated | OpenCL | Via NEO or Beignet |
-| No GPU | CPU | FFTW fallback, handles 10 MHz fine |
+| Raspberry Pi 5 | Vulkan | V3D passes validation but cannot sustain batch FFT throughput; use `--no-gpu` |
+| No GPU | CPU | FFTW fallback, handles 10 MHz fine on x86; ARM requires pre-generated wisdom (see above) |
 
-On fast x86 CPUs at 10 MHz, the CPU FFTW path keeps up easily. GPU acceleration helps most on weaker processors (Pi 5, embedded ARM) or at higher sample rates.
+On fast x86 CPUs at 10 MHz, the CPU FFTW path keeps up easily. GPU acceleration is most beneficial for continuous live capture on desktop/laptop systems. A startup validation test verifies GPU correctness by running a test FFT with a known input.
 
 Both backends can be disabled at runtime with `--no-gpu`.
 
