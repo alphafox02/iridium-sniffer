@@ -329,6 +329,11 @@ static void parse_ira(const uint8_t *bch_data, int n_bits, ira_data_t *ira)
     int pos_y = extract_signed12(&bch_data[25]);
     int pos_z = extract_signed12(&bch_data[37]);
 
+    /* Store raw XYZ for Doppler positioning */
+    ira->pos_xyz[0] = pos_x;
+    ira->pos_xyz[1] = pos_y;
+    ira->pos_xyz[2] = pos_z;
+
     /* Convert XYZ to lat/lon/alt */
     double xy = sqrt((double)pos_x * pos_x + (double)pos_y * pos_y);
     ira->lat = atan2((double)pos_z, xy) * 180.0 / M_PI;

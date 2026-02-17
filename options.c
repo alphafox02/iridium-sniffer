@@ -73,6 +73,8 @@ extern int gsmtap_port;
 extern int diagnostic_mode;
 extern int use_gardner;
 extern int parsed_mode;
+extern int position_enabled;
+extern double position_height;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -108,6 +110,8 @@ static void usage(int exitcode) {
 "\n"
 "Web map:\n"
 "    --web[=PORT]            enable live web map (default port: 8888)\n"
+"    --position[=HEIGHT_M]   estimate receiver position from Doppler shift\n"
+"                             optional height aiding in meters (implies --web)\n"
 "\n"
 "GSMTAP:\n"
 "    --gsmtap[=HOST:PORT]    send IDA frames as GSMTAP/LAPDm via UDP\n"
@@ -169,6 +173,7 @@ void parse_options(int argc, char **argv) {
         OPT_GARDNER,
         OPT_NO_GARDNER,
         OPT_PARSED,
+        OPT_POSITION,
     };
 
     static const struct option longopts[] = {
@@ -199,6 +204,7 @@ void parse_options(int argc, char **argv) {
         { "gardner",        no_argument,       NULL, OPT_GARDNER },
         { "no-gardner",     no_argument,       NULL, OPT_NO_GARDNER },
         { "parsed",         no_argument,       NULL, OPT_PARSED },
+        { "position",       optional_argument, NULL, OPT_POSITION },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -328,6 +334,13 @@ void parse_options(int argc, char **argv) {
 
             case OPT_PARSED:
                 parsed_mode = 1;
+                break;
+
+            case OPT_POSITION:
+                position_enabled = 1;
+                web_enabled = 1;  /* position implies web map */
+                if (optarg)
+                    position_height = atof(optarg);
                 break;
 
             case 'h':

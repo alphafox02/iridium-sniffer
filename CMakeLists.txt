@@ -84,6 +84,7 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/ida_decode.c
     ${PROJECT_SOURCE_DIR}/gsmtap.c
     ${PROJECT_SOURCE_DIR}/web_map.c
+    ${PROJECT_SOURCE_DIR}/doppler_pos.c
     ${PROJECT_SOURCE_DIR}/window_func.c
     ${PROJECT_SOURCE_DIR}/simd_generic.c
 )

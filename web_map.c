@@ -70,6 +70,10 @@ static struct {
     int n_sats;
     unsigned long total_ira;
     unsigned long total_ibc;
+    /* Doppler positioning receiver estimate */
+    double rx_lat, rx_lon;
+    double rx_hdop;
+    int rx_valid;
 } state;
 
 /* ---- Server state ---- */
@@ -141,6 +145,16 @@ void web_map_add_sat(const ibc_data_t *ibc, uint64_t timestamp)
     pthread_mutex_unlock(&state.lock);
 }
 
+void web_map_set_position(double lat, double lon, double hdop)
+{
+    pthread_mutex_lock(&state.lock);
+    state.rx_lat = lat;
+    state.rx_lon = lon;
+    state.rx_hdop = hdop;
+    state.rx_valid = 1;
+    pthread_mutex_unlock(&state.lock);
+}
+
 /* ---- JSON serialization ---- */
 
 static int build_json(char *buf, int bufsize)
@@ -172,16 +186,36 @@ static int build_json(char *buf, int bufsize)
     }
     off += snprintf(buf + off, bufsize - off, "],");
 
-    /* Active satellites */
-    off += snprintf(buf + off, bufsize - off, "\"sats\":[");
+    /* Active satellites (only those seen in last 15 minutes) */
+    uint64_t max_ts = 0;
     for (int i = 0; i < state.n_sats; i++) {
-        if (i > 0) off += snprintf(buf + off, bufsize - off, ",");
+        if (state.sats[i].last_seen > max_ts)
+            max_ts = state.sats[i].last_seen;
+    }
+    uint64_t sat_window = 15ULL * 60 * 1000000000ULL;  /* 15 minutes in ns */
+
+    off += snprintf(buf + off, bufsize - off, "\"sats\":[");
+    int first_sat = 1;
+    for (int i = 0; i < state.n_sats; i++) {
+        if (max_ts > sat_window && state.sats[i].last_seen < max_ts - sat_window)
+            continue;
+        if (!first_sat) off += snprintf(buf + off, bufsize - off, ",");
         off += snprintf(buf + off, bufsize - off,
             "{\"id\":%d,\"beam\":%d,\"count\":%d}",
             state.sats[i].sat_id, state.sats[i].beam_id,
             state.sats[i].count);
+        first_sat = 0;
     }
-    off += snprintf(buf + off, bufsize - off, "]}");
+    off += snprintf(buf + off, bufsize - off, "]");
+
+    /* Receiver position estimate (Doppler positioning) */
+    if (state.rx_valid) {
+        off += snprintf(buf + off, bufsize - off,
+            ",\"rx\":{\"lat\":%.6f,\"lon\":%.6f,\"hdop\":%.1f}",
+            state.rx_lat, state.rx_lon, state.rx_hdop);
+    }
+
+    off += snprintf(buf + off, bufsize - off, "}");
 
     pthread_mutex_unlock(&state.lock);
     return off;
@@ -243,6 +277,11 @@ static const char HTML_PAGE[] =
 "      background:#ef4444;border:2px solid #fbbf24\"></span>\n"
 "    Paging event (TMSI)\n"
 "  </div>\n"
+"  <div class=\"legend-row\">\n"
+"    <span class=\"legend-dot\" style=\"width:10px;height:10px;\n"
+"      background:#22c55e\"></span>\n"
+"    Receiver estimate\n"
+"  </div>\n"
 "</div>\n"
 "<script>\n"
 "var map=L.map('map',{zoomControl:true}).setView([20,0],2);\n"
@@ -257,6 +296,7 @@ static const char HTML_PAGE[] =
 "\n"
 "var satLayer=L.layerGroup().addTo(map);\n"
 "var pageLayer=L.layerGroup().addTo(map);\n"
+"var rxLayer=L.layerGroup().addTo(map);\n"
 "var centered=false;\n"
 "\n"
 "function update(d){\n"
@@ -269,38 +309,30 @@ static const char HTML_PAGE[] =
 "  satLayer.clearLayers();\n"
 "  pageLayer.clearLayers();\n"
 "\n"
-"  d.ra.forEach(function(p){\n"
-"    var hasPaging=(p.pages>0 && p.tmsi!==0);\n"
-"    var c=satColor(p.sat);\n"
-"    var m;\n"
-"    if(hasPaging){\n"
-"      m=L.circleMarker([p.lat,p.lon],{\n"
-"        radius:8,color:'#fbbf24',fillColor:'#ef4444',\n"
-"        fillOpacity:0.85,weight:2.5\n"
-"      });\n"
-"    }else{\n"
-"      m=L.circleMarker([p.lat,p.lon],{\n"
-"        radius:4,color:c,fillColor:c,fillOpacity:0.5,weight:1\n"
-"      });\n"
-"    }\n"
+"  /* Satellite/paging dots hidden for now (map redesign pending) */\n"
 "\n"
-"    var title=hasPaging?'Paging Event':'Satellite Position';\n"
-"    var info='<div class=\"popup-title\">'+title+'</div>'\n"
-"      +'Satellite: '+p.sat+'<br>'\n"
-"      +'Beam: '+p.beam+'<br>'\n"
-"      +'Position: '+p.lat.toFixed(2)+', '+p.lon.toFixed(2)+'<br>'\n"
-"      +'Altitude: '+p.alt+' km<br>'\n"
-"      +'Frequency: '+(p.freq/1e6).toFixed(3)+' MHz';\n"
-"    if(hasPaging){\n"
-"      info+='<br><span class=\"popup-page\">TMSI: 0x'\n"
-"        +('00000000'+p.tmsi.toString(16)).slice(-8)+'</span>';\n"
+"  rxLayer.clearLayers();\n"
+"  if(d.rx){\n"
+"    var rxm=L.circleMarker([d.rx.lat,d.rx.lon],{\n"
+"      radius:8,color:'#22c55e',fillColor:'#22c55e',\n"
+"      fillOpacity:0.9,weight:3\n"
+"    });\n"
+"    rxm.bindPopup('<div class=\"popup-title\">Receiver Position</div>'\n"
+"      +'Estimated: '+d.rx.lat.toFixed(6)+', '+d.rx.lon.toFixed(6)+'<br>'\n"
+"      +'HDOP: '+d.rx.hdop.toFixed(1));\n"
+"    rxm.addTo(rxLayer);\n"
+"    if(d.rx.hdop<50){\n"
+"      var r=d.rx.hdop*20;\n"
+"      L.circle([d.rx.lat,d.rx.lon],{radius:r,\n"
+"        color:'#22c55e',fillColor:'#22c55e',\n"
+"        fillOpacity:0.1,weight:1,dashArray:'4'}).addTo(rxLayer);\n"
 "    }\n"
-"    m.bindPopup(info);\n"
-"    if(hasPaging) m.addTo(pageLayer);\n"
-"    else m.addTo(satLayer);\n"
-"  });\n"
+"  }\n"
 "\n"
-"  if(!centered && d.ra.length>0){\n"
+"  if(!centered && d.rx){\n"
+"    map.setView([d.rx.lat,d.rx.lon],10);\n"
+"    centered=true;\n"
+"  } else if(!centered && d.ra.length>0){\n"
 "    map.setView([d.ra[0].lat,d.ra[0].lon],3);\n"
 "    centered=true;\n"
 "  }\n"

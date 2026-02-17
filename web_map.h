@@ -32,4 +32,7 @@ void web_map_add_ra(const ira_data_t *ra, uint64_t timestamp,
 /* Add/update a satellite from a decoded IBC frame. Thread-safe. */
 void web_map_add_sat(const ibc_data_t *ibc, uint64_t timestamp);
 
+/* Set estimated receiver position from Doppler positioning. Thread-safe. */
+void web_map_set_position(double lat, double lon, double hdop);
+
 #endif

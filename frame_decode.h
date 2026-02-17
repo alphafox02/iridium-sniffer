@@ -28,6 +28,7 @@ typedef struct {
     int beam_id;
     double lat, lon;
     int alt;                /* km */
+    int pos_xyz[3];         /* raw 12-bit signed XYZ (Doppler positioning) */
     int n_pages;
     struct {
         uint32_t tmsi;
