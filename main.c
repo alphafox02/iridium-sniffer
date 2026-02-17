@@ -46,6 +46,7 @@
 #include "frame_decode.h"
 #include "web_map.h"
 #include "ida_decode.h"
+#include "doppler_pos.h"
 #include "gsmtap.h"
 #include "fftw_lock.h"
 #include "simd_kernels.h"
@@ -135,6 +136,8 @@ char *save_bursts_dir = NULL;
 int diagnostic_mode = 0;
 int use_gardner = 1;
 int parsed_mode = 0;
+int position_enabled = 0;
+double position_height = 0;
 
 /* Threading state */
 volatile sig_atomic_t running = 1;
@@ -300,14 +303,21 @@ static void *frame_consumer_thread(void *arg) {
             else
                 frame_output_print(demod);
 
-            if (web_enabled) {
+            if (web_enabled || position_enabled) {
                 decoded_frame_t decoded;
                 if (frame_decode(demod, &decoded)) {
-                    if (decoded.type == FRAME_IRA)
-                        web_map_add_ra(&decoded.ira, decoded.timestamp,
-                                        decoded.frequency);
-                    else if (decoded.type == FRAME_IBC)
-                        web_map_add_sat(&decoded.ibc, decoded.timestamp);
+                    if (decoded.type == FRAME_IRA) {
+                        if (web_enabled)
+                            web_map_add_ra(&decoded.ira, decoded.timestamp,
+                                            decoded.frequency);
+                        if (position_enabled)
+                            doppler_pos_add_measurement(&decoded.ira,
+                                                         decoded.frequency,
+                                                         decoded.timestamp);
+                    } else if (decoded.type == FRAME_IBC) {
+                        if (web_enabled)
+                            web_map_add_sat(&decoded.ibc, decoded.timestamp);
+                    }
                 }
             }
 
@@ -452,6 +462,21 @@ static void *stats_thread_fn(void *arg) {
         /* Suppress unused variable warning */
         (void)dsamp;
 
+        /* Doppler positioning: attempt solve every 10 seconds */
+        if (position_enabled && (int)elapsed % 10 == 0 && elapsed > 5) {
+            doppler_solution_t sol;
+            if (doppler_pos_solve(&sol)) {
+                fprintf(stderr, "POSITION: %.6f, %.6f (HDOP=%.1f, %d sats, %d meas)\n",
+                        sol.lat, sol.lon, sol.hdop, sol.n_satellites,
+                        sol.n_measurements);
+                if (web_enabled)
+                    web_map_set_position(sol.lat, sol.lon, sol.hdop);
+            } else if ((int)elapsed % 60 == 0) {
+                fprintf(stderr, "POSITION: waiting (%d sats, %d meas)\n",
+                        sol.n_satellites, sol.n_measurements);
+            }
+        }
+
         /* Reset per-interval tracking */
         q_max = 0;
         prev_det     = det;
@@ -513,11 +538,19 @@ int main(int argc, char **argv) {
     fftw_load_wisdom();
     frame_output_init(file_info);
 
-    if (web_enabled || gsmtap_enabled)
+    if (web_enabled || gsmtap_enabled || position_enabled)
         frame_decode_init();
 
     if (parsed_mode || gsmtap_enabled)
         ida_decode_init();
+
+    if (position_enabled) {
+        doppler_pos_init();
+        if (position_height > 0)
+            doppler_pos_set_height(position_height);
+        fprintf(stderr, "Doppler positioning: enabled%s\n",
+                position_height > 0 ? " (with height aiding)" : "");
+    }
 
     if (web_enabled) {
         if (web_map_init(web_port) != 0)
@@ -587,14 +620,15 @@ int main(int argc, char **argv) {
         }
 #endif
 #ifdef HAVE_HACKRF
-        if (!sdr_started) {
+        if (!sdr_started && serial != NULL) {
             hackrf = hackrf_setup();
             hackrf_start_rx(hackrf, hackrf_rx_cb, NULL);
             sdr_started = 1;
         }
 #endif
         if (!sdr_started)
-            errx(1, "No SDR backend available (none compiled in or none selected)");
+            errx(1, "No SDR selected. Use -i to specify a device "
+                 "(e.g. -i soapy-0, -i hackrf-SERIAL, -i bladerf0, -i usrp-SERIAL)");
     } else if (in_file != NULL) {
         pthread_create(&spewer, NULL, spewer_thread, in_file);
 #ifdef __linux__
