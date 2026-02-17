@@ -121,23 +121,28 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 ## Quick Start
 
 ```bash
-# Live capture (auto-detect SDR)
-./iridium-sniffer -l
+# List available SDR devices
+./iridium-sniffer --list
+
+# Live capture (specify your SDR with -i)
+./iridium-sniffer -l -i soapy-0                          # RTL-SDR, Airspy, etc.
+./iridium-sniffer -l -i hackrf-SERIAL                # HackRF
+./iridium-sniffer -l -i usrp-PRODUCT-SERIAL             # USRP
 
 # Live capture with web map (open http://localhost:8888)
-./iridium-sniffer -l --web
+./iridium-sniffer -l -i soapy-0 --web
 
-# Process an IQ recording
+# Process an IQ recording (no -i needed)
 ./iridium-sniffer -f recording.cf32
 
 # Pipe to iridium-toolkit
-./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
 
 # Direct ACARS/SBD recovery (bypasses iridium-parser.py)
-./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # Send IDA frames to Wireshark
-./iridium-sniffer -l --gsmtap
+./iridium-sniffer -l -i soapy-0 --gsmtap
 ```
 
 ## Performance
@@ -191,18 +196,16 @@ The `--web` flag starts an embedded HTTP server that decodes IRA (ring alert) an
 
 ```bash
 # Default port 8888
-./iridium-sniffer -l --web
+./iridium-sniffer -l -i soapy-0 --web
 
 # Custom port
-./iridium-sniffer -l --web=9090
+./iridium-sniffer -l -i soapy-0 --web=9090
 ```
 
 Then open `http://localhost:8888` in a browser.
 
 The map shows:
 
-- **Satellite positions** as small colored circles (color = satellite ID). Each dot is a satellite's position at the time it transmitted a ring alert (IRA frame). Click for satellite ID, beam ID, coordinates, altitude, and frequency.
-- **Paging events** as larger red/gold circles. These appear when an IRA frame contains a paging block (TMSI), meaning the satellite is actively looking for a specific handset. The position is still the satellite's location, not the handset's -- the handset could be anywhere in the beam footprint.
 - **Active satellite count** and IRA/IBC frame totals in a status bar.
 - **Auto-centering** on the first received position, then free pan/zoom.
 
@@ -219,7 +222,7 @@ Data updates once per second via Server-Sent Events. The map uses Leaflet.js wit
 The web map runs alongside normal RAW output. Adding `--web` does not change what appears on stdout, so you can pipe to iridium-toolkit at the same time:
 
 ```bash
-./iridium-sniffer -l --web | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -l -i soapy-0 --web | python3 iridium-toolkit/iridium-parser.py
 ```
 
 ## GSMTAP Output (Wireshark Integration)
@@ -231,13 +234,13 @@ The `--gsmtap` flag enables native IDA (Iridium Data Access) frame decoding and 
 wireshark -k -i lo -f "udp port 4729"
 
 # In another terminal, run with GSMTAP enabled
-./iridium-sniffer -l --gsmtap
+./iridium-sniffer -l -i soapy-0 --gsmtap
 
 # Custom destination host and port
-./iridium-sniffer -l --gsmtap=192.168.1.100:4729
+./iridium-sniffer -l -i soapy-0 --gsmtap=192.168.1.100:4729
 
 # Combined with web map
-./iridium-sniffer -l --web --gsmtap
+./iridium-sniffer -l -i soapy-0 --web --gsmtap
 ```
 
 Wireshark decodes the packets as GSM/LAPDm signaling. Typical messages seen:
@@ -262,10 +265,10 @@ The `--parsed` flag enables internal IDA frame decoding with Chase BCH error cor
 
 ```bash
 # Direct to reassembler (no iridium-parser.py needed for IDA/ACARS/SBD)
-./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # Traditional pipeline (still works, decodes all frame types)
-./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
 ```
 
 **Current capabilities and limitations:**
@@ -290,7 +293,7 @@ The `--save-bursts` option saves IQ samples from successfully decoded bursts to 
 
 ```bash
 # Save all decoded bursts
-./iridium-sniffer -l --save-bursts bursts/
+./iridium-sniffer -l -i soapy-0 --save-bursts bursts/
 
 # Process file and save bursts
 ./iridium-sniffer -f recording.cf32 --format=cf32 --save-bursts bursts/
@@ -331,40 +334,46 @@ The IQ format is auto-detected from the file extension (`.cf32`/`.fc32`/`.cfile`
 
 ### Live Capture
 
-```bash
-# Auto-detect SDR
-./iridium-sniffer -l
+Live capture requires `-i` to select an SDR interface. Use `--list` to see available devices:
 
-# Specify interface (use --list to see your serial numbers)
-./iridium-sniffer -l -i hackrf-YOUR_SERIAL_HERE
-./iridium-sniffer -l -i usrp-B210-YOUR_SERIAL
-./iridium-sniffer -l -i bladerf0
+```bash
+./iridium-sniffer --list
+```
+
+Then specify the interface with `-i`:
+
+```bash
+# RTL-SDR / Airspy / other SoapySDR devices
 ./iridium-sniffer -l -i soapy-0
 
+# HackRF (use serial from --list)
+./iridium-sniffer -l -i hackrf-SERIAL
+
+# USRP (use serial from --list)
+./iridium-sniffer -l -i usrp-PRODUCT-SERIAL
+
+# BladeRF
+./iridium-sniffer -l -i bladerf1
+
 # With gain and bias tee
-./iridium-sniffer -l -B --hackrf-lna=40 --hackrf-vga=20
-./iridium-sniffer -l --usrp-gain=50
+./iridium-sniffer -l -i soapy-0 -B --soapy-gain=40
+./iridium-sniffer -l -i hackrf-SERIAL --hackrf-lna=40 --hackrf-vga=20
+./iridium-sniffer -l -i usrp-PRODUCT-SERIAL --usrp-gain=50
 ```
 
 ### Piping to iridium-toolkit
 
 ```bash
 # Real-time decode
-./iridium-sniffer -l | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
 
 # Direct to reassembler (parsed mode, bypasses iridium-parser.py)
-./iridium-sniffer -l --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # File processing with full reassembly (traditional pipeline)
 ./iridium-sniffer -f recording.cf32 --format cf32 | \
     python3 iridium-toolkit/iridium-parser.py | \
     python3 iridium-toolkit/reassembler.py
-```
-
-### List Available SDRs
-
-```bash
-./iridium-sniffer --list
 ```
 
 ## Command Reference
@@ -374,12 +383,13 @@ Usage: iridium-sniffer <-f FILE | -l> [options]
 
 Input (one required):
     -f, --file=FILE         read IQ samples from file
-    -l, --live              capture live from SDR
+    -l, --live              capture live from SDR (requires -i)
     --format=FMT            IQ file format: ci8 (default), ci16, cf32
                              Auto-detected from file extension when not specified
 
 SDR options:
-    -i, --interface=IFACE   SDR to use (hackrf-SERIAL, bladerf0, usrp-PROD-SERIAL, soapy-N)
+    -i, --interface=IFACE   SDR to use (required for -l):
+                             soapy-N, hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL
     -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)
     -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)
     -B, --bias-tee          enable bias tee power

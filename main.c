@@ -628,7 +628,7 @@ int main(int argc, char **argv) {
 #endif
         if (!sdr_started)
             errx(1, "No SDR selected. Use -i to specify a device "
-                 "(e.g. -i soapy-0, -i hackrf-SERIAL, -i bladerf0, -i usrp-SERIAL)");
+                 "(run --list to see available devices)");
     } else if (in_file != NULL) {
         pthread_create(&spewer, NULL, spewer_thread, in_file);
 #ifdef __linux__
