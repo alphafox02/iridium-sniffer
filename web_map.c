@@ -70,6 +70,7 @@ static struct {
     int n_sats;
     unsigned long total_ira;
     unsigned long total_ibc;
+    unsigned long total_pages;
     /* Doppler positioning receiver estimate */
     double rx_lat, rx_lon;
     double rx_hdop;
@@ -87,10 +88,12 @@ static volatile int server_running = 0;
 void web_map_add_ra(const ira_data_t *ra, uint64_t timestamp,
                      double frequency)
 {
-    /* Sanity check coordinates */
+    /* Sanity check coordinates and altitude (Iridium orbits ~780 km) */
     if (ra->lat < -90 || ra->lat > 90 || ra->lon < -180 || ra->lon > 180)
         return;
     if (ra->sat_id == 0 && ra->beam_id == 0 && ra->lat == 0 && ra->lon == 0)
+        return;
+    if (ra->alt < 700 || ra->alt > 900)
         return;
 
     pthread_mutex_lock(&state.lock);
@@ -110,6 +113,8 @@ void web_map_add_ra(const ira_data_t *ra, uint64_t timestamp,
     if (state.ra_count < MAX_RA_POINTS)
         state.ra_count++;
     state.total_ira++;
+    if (ra->n_pages > 0)
+        state.total_pages++;
 
     pthread_mutex_unlock(&state.lock);
 }
@@ -163,8 +168,8 @@ static int build_json(char *buf, int bufsize)
 
     int off = 0;
     off += snprintf(buf + off, bufsize - off,
-                    "{\"total_ira\":%lu,\"total_ibc\":%lu,",
-                    state.total_ira, state.total_ibc);
+                    "{\"total_ira\":%lu,\"total_ibc\":%lu,\"total_pages\":%lu,",
+                    state.total_ira, state.total_ibc, state.total_pages);
 
     /* Ring alert points (most recent first, max 500 for browser) */
     off += snprintf(buf + off, bufsize - off, "\"ra\":[");
@@ -177,10 +182,11 @@ static int build_json(char *buf, int bufsize)
         off += snprintf(buf + off, bufsize - off,
             "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
             "\"sat\":%d,\"beam\":%d,\"pages\":%d,"
-            "\"tmsi\":%u,\"freq\":%.0f}",
+            "\"tmsi\":%u,\"freq\":%.0f,\"t\":%llu}",
             p->lat, p->lon, p->alt,
             p->sat_id, p->beam_id, p->n_pages,
-            p->tmsi, p->frequency);
+            p->tmsi, p->frequency,
+            (unsigned long long)(p->timestamp / 1000000000ULL));
         n_out++;
         if (off >= bufsize - 256) break;
     }
@@ -254,33 +260,35 @@ static const char HTML_PAGE[] =
 ".legend-title{font-weight:700;font-size:11px;text-transform:uppercase;\n"
 "  letter-spacing:1px;color:#94a3b8;margin-bottom:2px}\n"
 ".legend-row{display:flex;align-items:center;gap:8px}\n"
-".legend-dot{display:inline-block;border-radius:50%}\n"
+".legend-swatch{display:inline-block}\n"
 ".leaflet-container{background:#0f172a}\n"
 "</style></head><body>\n"
 "<div id=\"bar\">\n"
 "  <span class=\"title\">iridium-sniffer</span>\n"
-"  <span class=\"stat\">Ring Alerts <span id=\"n-ira\" class=\"val\">0</span></span>\n"
-"  <span class=\"stat\">Broadcasts <span id=\"n-ibc\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">IRA <span id=\"n-ira\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">IBC <span id=\"n-ibc\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">Satellites <span id=\"n-sats\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">Pages <span id=\"n-pages\" class=\"val\">0</span></span>\n"
 "  <span id=\"status\" style=\"color:#64748b\">connecting...</span>\n"
 "</div>\n"
 "<div id=\"map\"></div>\n"
 "<div class=\"legend\">\n"
-"  <div class=\"legend-title\">Markers</div>\n"
+"  <div class=\"legend-title\">Map</div>\n"
 "  <div class=\"legend-row\">\n"
-"    <span class=\"legend-dot\" style=\"width:10px;height:10px;\n"
-"      background:#3b82f6;opacity:0.7\"></span>\n"
-"    Satellite position\n"
+"    <span class=\"legend-swatch\" style=\"width:16px;height:16px;\n"
+"      border-radius:50%;border:1px solid #3b82f6;\n"
+"      background:rgba(59,130,246,0.12)\"></span>\n"
+"    Beam coverage\n"
 "  </div>\n"
 "  <div class=\"legend-row\">\n"
-"    <span class=\"legend-dot\" style=\"width:12px;height:12px;\n"
-"      background:#ef4444;border:2px solid #fbbf24\"></span>\n"
-"    Paging event (TMSI)\n"
+"    <span class=\"legend-swatch\" style=\"width:10px;height:10px;\n"
+"      border-radius:50%;background:#ef4444\"></span>\n"
+"    Paging event\n"
 "  </div>\n"
 "  <div class=\"legend-row\">\n"
-"    <span class=\"legend-dot\" style=\"width:10px;height:10px;\n"
-"      background:#22c55e\"></span>\n"
-"    Receiver estimate\n"
+"    <span class=\"legend-swatch\" style=\"width:10px;height:10px;\n"
+"      border-radius:50%;background:#22c55e\"></span>\n"
+"    Receiver position\n"
 "  </div>\n"
 "</div>\n"
 "<script>\n"
@@ -288,51 +296,107 @@ static const char HTML_PAGE[] =
 "L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{\n"
 "  attribution:'CartoDB',maxZoom:18,subdomains:'abcd'}).addTo(map);\n"
 "\n"
-"var satColors=[\n"
+"var C=[\n"
 "  '#3b82f6','#22d3ee','#10b981','#a78bfa','#f472b6',\n"
 "  '#fb923c','#facc15','#4ade80','#818cf8','#f87171',\n"
 "  '#2dd4bf','#c084fc','#38bdf8','#fb7185','#a3e635'];\n"
-"function satColor(id){return satColors[id%satColors.length]}\n"
+"function sc(id){return C[id%C.length]}\n"
 "\n"
-"var satLayer=L.layerGroup().addTo(map);\n"
-"var pageLayer=L.layerGroup().addTo(map);\n"
-"var rxLayer=L.layerGroup().addTo(map);\n"
+"var coverLy=L.layerGroup().addTo(map);\n"
+"var satLy=L.layerGroup().addTo(map);\n"
+"var pageLy=L.layerGroup().addTo(map);\n"
+"var rxLy=L.layerGroup().addTo(map);\n"
 "var centered=false;\n"
+"var TW=300;\n"
+"var popupOpen=false;\n"
+"map.on('popupopen',function(){popupOpen=true});\n"
+"map.on('popupclose',function(){popupOpen=false});\n"
 "\n"
 "function update(d){\n"
 "  document.getElementById('n-ira').textContent=d.total_ira;\n"
 "  document.getElementById('n-ibc').textContent=d.total_ibc;\n"
-"  document.getElementById('n-sats').textContent=d.sats.length;\n"
+"  document.getElementById('n-pages').textContent=d.total_pages;\n"
 "  document.getElementById('status').style.color='#22c55e';\n"
 "  document.getElementById('status').textContent='live';\n"
 "\n"
-"  satLayer.clearLayers();\n"
-"  pageLayer.clearLayers();\n"
+"  if(popupOpen)return;\n"
 "\n"
-"  /* Satellite/paging dots hidden for now (map redesign pending) */\n"
+"  coverLy.clearLayers();\n"
+"  satLy.clearLayers();\n"
+"  pageLy.clearLayers();\n"
 "\n"
-"  rxLayer.clearLayers();\n"
+"  var bySat={},pages=[],now=0;\n"
+"  d.ra.forEach(function(p){\n"
+"    if(p.t>now)now=p.t;\n"
+"    if(!bySat[p.sat])bySat[p.sat]=[];\n"
+"    bySat[p.sat].push(p);\n"
+"    if(p.pages>0)pages.push(p);\n"
+"  });\n"
+"\n"
+"  var cut=now-TW,nSat=0;\n"
+"  Object.keys(bySat).forEach(function(sid){\n"
+"    var pts=bySat[sid]\n"
+"      .filter(function(p){return p.t>=cut})\n"
+"      .sort(function(a,b){return a.t-b.t});\n"
+"    if(!pts.length)return;\n"
+"    nSat++;\n"
+"    var col=sc(parseInt(sid));\n"
+"    var last=pts[pts.length-1];\n"
+"\n"
+"    L.circle([last.lat,last.lon],{radius:400000,\n"
+"      color:col,weight:1,opacity:0.4,\n"
+"      fillColor:col,fillOpacity:0.08\n"
+"    }).addTo(coverLy);\n"
+"\n"
+"    var m=L.circleMarker([last.lat,last.lon],{\n"
+"      radius:5,color:col,fillColor:col,fillOpacity:0.9,weight:2\n"
+"    });\n"
+"    m.bindTooltip('Sat '+sid,{direction:'top',offset:[0,-8]});\n"
+"    m.bindPopup('<div class=\"popup-title\">Satellite '+sid+'</div>'\n"
+"      +'Beam: '+last.beam+'<br>'\n"
+"      +'Position: '+last.lat.toFixed(2)+', '+last.lon.toFixed(2)+'<br>'\n"
+"      +'Altitude: '+last.alt+' km<br>'\n"
+"      +'Frequency: '+last.freq.toFixed(0)+' Hz<br>'\n"
+"      +'Beams: '+pts.length);\n"
+"    m.addTo(satLy);\n"
+"  });\n"
+"\n"
+"  document.getElementById('n-sats').textContent=nSat;\n"
+"\n"
+"  pages.forEach(function(p){\n"
+"    if(p.t<cut)return;\n"
+"    var pm=L.circleMarker([p.lat,p.lon],{\n"
+"      radius:6,color:'#ef4444',fillColor:'#ef4444',\n"
+"      fillOpacity:0.7,weight:1\n"
+"    });\n"
+"    pm.bindPopup('<div class=\"popup-title popup-page\">Paging</div>'\n"
+"      +'Satellite: '+p.sat+'<br>'\n"
+"      +'TMSI: 0x'+(p.tmsi>>>0).toString(16).toUpperCase()+'<br>'\n"
+"      +'Position: '+p.lat.toFixed(2)+', '+p.lon.toFixed(2));\n"
+"    pm.addTo(pageLy);\n"
+"  });\n"
+"\n"
+"  rxLy.clearLayers();\n"
 "  if(d.rx){\n"
-"    var rxm=L.circleMarker([d.rx.lat,d.rx.lon],{\n"
+"    var rm=L.circleMarker([d.rx.lat,d.rx.lon],{\n"
 "      radius:8,color:'#22c55e',fillColor:'#22c55e',\n"
 "      fillOpacity:0.9,weight:3\n"
 "    });\n"
-"    rxm.bindPopup('<div class=\"popup-title\">Receiver Position</div>'\n"
+"    rm.bindPopup('<div class=\"popup-title\">Receiver Position</div>'\n"
 "      +'Estimated: '+d.rx.lat.toFixed(6)+', '+d.rx.lon.toFixed(6)+'<br>'\n"
 "      +'HDOP: '+d.rx.hdop.toFixed(1));\n"
-"    rxm.addTo(rxLayer);\n"
+"    rm.addTo(rxLy);\n"
 "    if(d.rx.hdop<50){\n"
-"      var r=d.rx.hdop*20;\n"
-"      L.circle([d.rx.lat,d.rx.lon],{radius:r,\n"
+"      L.circle([d.rx.lat,d.rx.lon],{radius:d.rx.hdop*20,\n"
 "        color:'#22c55e',fillColor:'#22c55e',\n"
-"        fillOpacity:0.1,weight:1,dashArray:'4'}).addTo(rxLayer);\n"
+"        fillOpacity:0.1,weight:1,dashArray:'4'}).addTo(rxLy);\n"
 "    }\n"
 "  }\n"
 "\n"
 "  if(!centered && d.rx){\n"
-"    map.setView([d.rx.lat,d.rx.lon],10);\n"
+"    map.setView([d.rx.lat,d.rx.lon],6);\n"
 "    centered=true;\n"
-"  } else if(!centered && d.ra.length>0){\n"
+"  }else if(!centered && d.ra.length>0){\n"
 "    map.setView([d.ra[0].lat,d.ra[0].lon],3);\n"
 "    centered=true;\n"
 "  }\n"
