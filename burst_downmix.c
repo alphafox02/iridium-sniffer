@@ -799,10 +799,7 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
 /* ---- Thread function ---- */
 
 void *burst_downmix_thread(void *arg) {
-    (void)arg;
-
-    downmix_config_t config = { 0 };
-    burst_downmix_t *dm = burst_downmix_create(&config);
+    burst_downmix_t *dm = (burst_downmix_t *)arg;
 
     while (1) {
         burst_data_t *burst;

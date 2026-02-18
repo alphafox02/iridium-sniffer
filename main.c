@@ -566,8 +566,34 @@ int main(int argc, char **argv) {
     blocking_queue_init(&burst_queue, BURST_QUEUE_SIZE);
     blocking_queue_init(&frame_queue, FRAME_QUEUE_SIZE);
 
+    /* Create burst detector and all downmix workers here in the main thread,
+     * before the SDR starts. FFTW_MEASURE plan creation can take several
+     * seconds without wisdom; doing it here ensures the detector is fully
+     * initialized before any samples arrive, preventing startup queue saturation. */
+    burst_config_t det_config = {
+        .center_frequency = center_freq,
+        .sample_rate = (int)samp_rate,
+        .fft_size = 0,
+        .burst_pre_len = 0,
+        .burst_post_len = 0,
+        .burst_width = IR_DEFAULT_BURST_WIDTH,
+        .max_bursts = 0,
+        .max_burst_len = 0,
+        .threshold = (float)threshold_db,
+        .history_size = IR_DEFAULT_HISTORY_SIZE,
+        .use_gpu = use_gpu,
+    };
+    burst_detector_t *det = burst_detector_create(&det_config);
+    global_detector = det;
+
+    burst_downmix_t *dm[NUM_DOWNMIX_WORKERS];
+    for (int i = 0; i < NUM_DOWNMIX_WORKERS; i++) {
+        downmix_config_t dm_config = { 0 };
+        dm[i] = burst_downmix_create(&dm_config);
+    }
+
     /* Launch burst detector thread */
-    pthread_create(&detector, NULL, burst_detector_thread, NULL);
+    pthread_create(&detector, NULL, burst_detector_thread, det);
 #ifdef __linux__
     pthread_setname_np(detector, "detector");
 #endif
@@ -575,7 +601,7 @@ int main(int argc, char **argv) {
     /* Launch downmix worker pool */
     pthread_t downmix_workers[NUM_DOWNMIX_WORKERS];
     for (int i = 0; i < NUM_DOWNMIX_WORKERS; i++) {
-        pthread_create(&downmix_workers[i], NULL, burst_downmix_thread, NULL);
+        pthread_create(&downmix_workers[i], NULL, burst_downmix_thread, dm[i]);
 #ifdef __linux__
         char name[16];
         snprintf(name, sizeof(name), "downmix-%d", i);

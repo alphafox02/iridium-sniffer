@@ -939,32 +939,7 @@ static void burst_to_queue(burst_data_t *burst, void *user) {
 /* ---- Thread function ---- */
 
 void *burst_detector_thread(void *arg) {
-    (void)arg;
-
-    extern double samp_rate;
-    extern double center_freq;
-    extern double threshold_db;
-    extern int use_gpu;
-
-    burst_config_t config = {
-        .center_frequency = center_freq,
-        .sample_rate = (int)samp_rate,
-        .fft_size = 0,          /* auto */
-        .burst_pre_len = 0,     /* auto */
-        .burst_post_len = 0,    /* auto */
-        .burst_width = IR_DEFAULT_BURST_WIDTH,
-        .max_bursts = 0,        /* auto */
-        .max_burst_len = 0,     /* auto */
-        .threshold = (float)threshold_db,
-        .history_size = IR_DEFAULT_HISTORY_SIZE,
-        .use_gpu = use_gpu,
-    };
-
-    burst_detector_t *det = burst_detector_create(&config);
-
-    /* Make detector available for diagnostic stats */
-    extern burst_detector_t *global_detector;
-    global_detector = det;
+    burst_detector_t *det = (burst_detector_t *)arg;
 
     while (1) {
         sample_buf_t *samples;
