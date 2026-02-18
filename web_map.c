@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,9 @@
 #define MAX_SSE_CLIENTS 8
 #define JSON_BUF_SIZE   65536
 #define HTTP_BUF_SIZE   4096
+
+/* ---- SSE client count ---- */
+static atomic_int sse_client_count = 0;
 
 /* ---- Shared state ---- */
 
@@ -503,7 +507,14 @@ static void *client_thread(void *arg)
                        HTML_PAGE, sizeof(HTML_PAGE) - 1);
         close(fd);
     } else if (strcmp(path, "/api/events") == 0) {
-        handle_sse(fd);
+        if (atomic_fetch_add(&sse_client_count, 1) >= MAX_SSE_CLIENTS) {
+            atomic_fetch_sub(&sse_client_count, 1);
+            send_response(fd, "503 Service Unavailable", "text/plain",
+                          "too many clients", 16);
+        } else {
+            handle_sse(fd);
+            atomic_fetch_sub(&sse_client_count, 1);
+        }
         close(fd);
     } else if (strcmp(path, "/api/state") == 0) {
         char *json = malloc(JSON_BUF_SIZE);

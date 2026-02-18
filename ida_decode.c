@@ -741,7 +741,7 @@ void ida_reassemble_flush(ida_context_t *ctx, uint64_t now_ns)
 {
     for (int i = 0; i < IDA_MAX_REASSEMBLY; i++) {
         ida_reassembly_t *s = &ctx->slots[i];
-        if (s->active && now_ns > s->last_timestamp + 1000000000ULL) {
+        if (s->active && now_ns > s->last_timestamp + 280000000ULL) {
             s->active = 0;
         }
     }

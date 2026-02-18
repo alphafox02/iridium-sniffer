@@ -339,8 +339,12 @@ void parse_options(int argc, char **argv) {
             case OPT_POSITION:
                 position_enabled = 1;
                 web_enabled = 1;  /* position implies web map */
-                if (optarg)
+                if (optarg) {
                     position_height = atof(optarg);
+                    if (position_height < 0 || position_height > 9000)
+                        errx(1, "--position height must be 0-9000 m (got %.0f)",
+                             position_height);
+                }
                 break;
 
             case 'h':
