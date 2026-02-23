@@ -173,6 +173,8 @@ The default 16 dB threshold detects more bursts than gr-iridium, including weake
 
 At 18 dB (gr-iridium's default), burst detection counts are nearly identical. The ok rate gap narrows to 70% vs 74%. The external parser IDA gap (464 vs 690) reflects that gr-iridium's GNU Radio-based demodulator produces cleaner bits -- more frames survive standard BCH correction. Chase soft-decision decoding in `--parsed` mode compensates for this (576 vs 464), but the demodulator quality gap is the area with the most room for improvement. Use `--threshold=18` if ok rate percentage is more important than total frame count.
 
+**A note on live ok% rates:** In live SDR capture, you may see ok\_avg of 25-40% with iridium-sniffer compared to 70-80% shown in gr-iridium guides. This is expected and not a problem. iridium-sniffer uses a lower default detection threshold (16 dB vs gr-iridium's 18 dB), which catches more weak bursts at the noise floor. These marginal detections lower the ok percentage but increase the total number of successfully decoded frames. The ok% statistic measures what fraction of detected bursts decode -- not how many frames you are actually recovering. What matters is decoded frames per second, and iridium-sniffer typically recovers more usable data than gr-iridium despite the lower ok% figure.
+
 **Processing speed (60s cf32 file, i7-11800H):**
 
 | Configuration | Wall time | CPU time | Realtime factor |
