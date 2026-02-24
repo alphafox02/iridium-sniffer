@@ -75,6 +75,9 @@ extern int use_gardner;
 extern int parsed_mode;
 extern int position_enabled;
 extern double position_height;
+extern int acars_enabled;
+extern int acars_json;
+extern char *station_id;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -123,6 +126,9 @@ static void usage(int exitcode) {
 "    --diagnostic            setup verification mode (suppresses RAW output)\n"
 "    --no-gardner           disable Gardner timing recovery (enabled by default)\n"
 "    --parsed               output parsed IDA lines (pipe to reassembler.py)\n"
+"    --acars               decode and display ACARS messages from IDA\n"
+"    --acars-json          output ACARS as JSON (compatible with acars.py)\n"
+"    --station=ID          station identifier for ACARS JSON output\n"
 "    -v, --verbose           verbose output to stderr\n"
 "    -h, --help              show this help\n"
 "    --list                  list available SDR interfaces\n"
@@ -174,6 +180,9 @@ void parse_options(int argc, char **argv) {
         OPT_NO_GARDNER,
         OPT_PARSED,
         OPT_POSITION,
+        OPT_ACARS,
+        OPT_ACARS_JSON,
+        OPT_STATION,
     };
 
     static const struct option longopts[] = {
@@ -205,6 +214,9 @@ void parse_options(int argc, char **argv) {
         { "no-gardner",     no_argument,       NULL, OPT_NO_GARDNER },
         { "parsed",         no_argument,       NULL, OPT_PARSED },
         { "position",       optional_argument, NULL, OPT_POSITION },
+        { "acars",          no_argument,       NULL, OPT_ACARS },
+        { "acars-json",     no_argument,       NULL, OPT_ACARS_JSON },
+        { "station",        required_argument, NULL, OPT_STATION },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -345,6 +357,19 @@ void parse_options(int argc, char **argv) {
                         errx(1, "--position height must be 0-9000 m (got %.0f)",
                              position_height);
                 }
+                break;
+
+            case OPT_ACARS:
+                acars_enabled = 1;
+                break;
+
+            case OPT_ACARS_JSON:
+                acars_enabled = 1;
+                acars_json = 1;
+                break;
+
+            case OPT_STATION:
+                station_id = strdup(optarg);
                 break;
 
             case 'h':

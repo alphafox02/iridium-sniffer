@@ -48,6 +48,7 @@
 #include "ida_decode.h"
 #include "doppler_pos.h"
 #include "gsmtap.h"
+#include "sbd_acars.h"
 #include "fftw_lock.h"
 #include "simd_kernels.h"
 #include <fftw3.h>
@@ -138,6 +139,8 @@ int use_gardner = 1;
 int parsed_mode = 0;
 int position_enabled = 0;
 double position_height = 0;
+int acars_enabled = 0;
+char *station_id = NULL;
 
 /* Threading state */
 volatile sig_atomic_t running = 1;
@@ -261,6 +264,7 @@ static void *spewer_thread(void *arg) {
 /* ---- IDA/GSMTAP state ---- */
 
 static ida_context_t ida_ctx;
+static ida_context_t acars_ida_ctx;
 
 static atomic_ulong gsmtap_sent_count = 0;
 
@@ -294,7 +298,7 @@ static void *frame_consumer_thread(void *arg) {
             /* Try IDA decode if parsed output or GSMTAP is active */
             int ida_ok = 0;
             ida_burst_t burst;
-            if (parsed_mode || gsmtap_enabled)
+            if (parsed_mode || gsmtap_enabled || acars_enabled)
                 ida_ok = ida_decode(demod, &burst);
 
             /* Output: parsed IDA line if available, otherwise RAW */
@@ -325,6 +329,13 @@ static void *frame_consumer_thread(void *arg) {
                 if (ida_ok)
                     ida_reassemble(&ida_ctx, &burst, gsmtap_ida_cb, NULL);
                 ida_reassemble_flush(&ida_ctx, demod->timestamp);
+            }
+
+            if (acars_enabled) {
+                if (ida_ok)
+                    ida_reassemble(&acars_ida_ctx, &burst,
+                                   acars_ida_cb, NULL);
+                ida_reassemble_flush(&acars_ida_ctx, demod->timestamp);
             }
 
             free(demod->bits);
@@ -541,7 +552,7 @@ int main(int argc, char **argv) {
     if (web_enabled || gsmtap_enabled || position_enabled)
         frame_decode_init();
 
-    if (parsed_mode || gsmtap_enabled)
+    if (parsed_mode || gsmtap_enabled || acars_enabled)
         ida_decode_init();
 
     if (position_enabled) {
@@ -560,6 +571,13 @@ int main(int argc, char **argv) {
     if (gsmtap_enabled) {
         if (gsmtap_init(gsmtap_host, gsmtap_port) != 0)
             errx(1, "Failed to initialize GSMTAP socket");
+    }
+
+    if (acars_enabled) {
+        acars_init(station_id);
+        fprintf(stderr, "ACARS: enabled (%s output%s)\n",
+                acars_json ? "JSON" : "text",
+                station_id ? ", station set" : "");
     }
 
     blocking_queue_init(&samples_queue, SAMPLES_QUEUE_SIZE);
