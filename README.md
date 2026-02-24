@@ -6,12 +6,15 @@ Supports HackRF, BladeRF, USRP (UHD), and SoapySDR for live capture, or processe
 
 A built-in web map (`--web`, beta) provides a real-time Leaflet.js visualization of decoded ring alert positions and active satellites -- no external tools or Python required.
 
+Built-in ACARS/SBD decoding (`--acars`) extracts aviation messages directly from IDA frames. When [libacars-2](https://github.com/szpajder/libacars) is installed, ARINC-622 application payloads (ADS-C, CPDLC, OHMA) are fully decoded -- no Python pipeline needed.
+
 Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames directly to Wireshark via UDP, eliminating the need for the Python `iridium-parser.py -m gsmtap` pipeline.
 
 ## Features
 
 - Full Iridium L-band burst detection, downmix, and DQPSK demodulation pipeline
 - Direct iridium-toolkit RAW output, compatible with iridium-parser.py and reassembler.py
+- Built-in ACARS/SBD decoding (`--acars`) with optional libacars-2 ARINC-622/ADS-C/CPDLC support
 - Parsed IDA output mode (`--parsed`) for direct reassembler.py piping (ACARS/SBD recovery)
 - Chase BCH soft-decision decoding recovers 37% more IDA frames than iridium-parser.py
 - Gardner timing recovery (enabled by default) for improved weak burst demodulation
@@ -37,7 +40,7 @@ cmake ..
 make -j$(nproc)
 ```
 
-CMake auto-detects the available SDR libraries and GPU support. All SDR backends and OpenCL GPU acceleration should be enabled automatically.
+CMake auto-detects the available SDR libraries, GPU support, and libacars. All SDR backends, OpenCL GPU acceleration, and ACARS ARINC-622 decoding should be enabled automatically.
 
 ### Ubuntu / Debian
 
@@ -54,6 +57,9 @@ sudo apt install libbladerf-dev     # BladeRF
 sudo apt install libuhd-dev         # USRP (B2x0, N2x0, X3x0, etc.)
 sudo apt install libsoapysdr-dev    # RTL-SDR, Airspy, LimeSDR, etc. via SoapySDR
 
+# Optional: ACARS ARINC-622/ADS-C/CPDLC decoding
+sudo apt install libacars-dev        # libacars-2
+
 # Optional: GPU-accelerated burst detection
 sudo apt install ocl-icd-opencl-dev  # OpenCL (NVIDIA, AMD, Intel)
 
@@ -69,6 +75,7 @@ CMake output shows what was detected:
 -- BladeRF: enabled
 -- USRP (UHD): enabled
 -- SoapySDR: enabled
+-- libacars: enabled (ARINC-622/ADS-C/CPDLC decoding)
 -- GPU acceleration: OpenCL
 ```
 
@@ -139,7 +146,13 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 # Pipe to iridium-toolkit
 ./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
 
-# Direct ACARS/SBD recovery (bypasses iridium-parser.py)
+# Built-in ACARS/SBD decoding (no Python needed)
+./iridium-sniffer -l -i soapy-0 --acars
+
+# ACARS JSON for airframes.io
+./iridium-sniffer -l -i soapy-0 --acars-json --station=MYSTATION
+
+# Direct ACARS/SBD recovery via iridium-toolkit (bypasses iridium-parser.py)
 ./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # Estimate receiver position from Doppler shift (with web map)
@@ -285,6 +298,84 @@ The IDA decoder implements:
 - Multi-burst reassembly (16 concurrent slots, frequency/time/sequence matching)
 
 GSMTAP runs alongside normal RAW output and the web map. Adding `--gsmtap` does not change stdout.
+
+## Built-in ACARS / SBD Decoding
+
+The `--acars` flag enables native ACARS and SBD (Short Burst Data) decoding directly from IDA frames, with no Python pipeline required. This replaces the `reassembler.py -m acars` step entirely.
+
+When [libacars-2](https://github.com/szpajder/libacars) is installed, iridium-sniffer automatically uses it for full ARINC-622 application layer decoding -- ADS-C position reports, CPDLC controller-pilot datalink, OHMA, MIAM, and other payloads embedded within ACARS messages. Without libacars, basic ACARS field extraction still works.
+
+```bash
+# Human-readable text output
+./iridium-sniffer -l -i usrp-B210-SERIAL --acars
+
+# JSON output (airframes.io compatible)
+./iridium-sniffer -l -i usrp-B210-SERIAL --acars-json
+
+# JSON with station identifier
+./iridium-sniffer -l -i usrp-B210-SERIAL --acars-json --station=MYSTATION
+```
+
+**Text output example (with libacars):**
+
+```
+ACARS: 2026-02-24T13:06:52Z DL [hdr:iridium]
+ACARS:
+ Reassembly: skipped
+ Reg: .N-XXXXX
+ Mode: 2 Label: H1 Blk id: F More: 0 Ack: !
+ Sublabel: MD
+ Message:
+  MSG/RX24-FEB-26 1306Z /RXFLIGHT PLANS PXXXX AND PXXXX ARE AVAILABLE FOR UPLINK
+```
+
+Heartbeat pings (Label `_d`) are the most common ACARS message type on Iridium. H1-labeled messages carry ARINC-622 application data -- airline operational control (AOC) messages, flight plan uplinks, ADS-C position reports, and CPDLC clearances. When libacars is present, these payloads are decoded into structured fields rather than appearing as opaque binary.
+
+Non-ACARS SBD traffic (IoT telemetry, maritime tracking, etc.) is also displayed:
+
+```
+SBD: 2026-02-24T12:56:07Z DL 6841542344504f4c4c203635313530 | hAT#DPOLL 65150
+```
+
+**JSON mode** produces one JSON object per line, compatible with the [airframes.io](https://airframes.io) ingestion pipeline:
+
+```json
+{"app":{"name":"iridium-sniffer","version":"1.0"},"source":{"transport":"iridium","protocol":"acars","parser":"libacars","station_id":"MYSTATION"},"acars":{"timestamp":"2026-02-24T13:06:52Z","errors":0,"link_direction":"downlink","block_end":true,"mode":"2","tail":"N-XXXXX","label":"H1","block_id":"F","sublabel":"MD","text":"..."}}
+```
+
+**Shutdown stats** are printed to stderr:
+
+```
+SBD: 339 packets from 15964 IDA messages (75 short, 260 single, 1 multi-pkt)
+ACARS: 80 messages decoded (1 with errors)
+```
+
+### Installing libacars (optional but recommended)
+
+libacars-2 is optional. Without it, ACARS messages are still decoded but ARINC-622 application payloads remain as raw text. With it, ADS-C, CPDLC, and other embedded protocols are fully decoded.
+
+```bash
+# Ubuntu / Debian / DragonOS
+sudo apt install libacars-dev
+
+# Or build from source
+git clone https://github.com/szpajder/libacars.git
+cd libacars && mkdir build && cd build
+cmake .. && make -j$(nproc) && sudo make install
+sudo ldconfig
+```
+
+CMake reports the detection status at build time:
+
+```
+-- libacars: enabled (ARINC-622/ADS-C/CPDLC decoding)
+```
+
+or:
+
+```
+-- libacars: not found (basic ACARS only)
+```
 
 ## Parsed IDA Output
 
@@ -440,6 +531,11 @@ GSMTAP:
     --gsmtap[=HOST:PORT]    send IDA frames as GSMTAP/LAPDm via UDP
                              (default: 127.0.0.1:4729, for Wireshark)
 
+ACARS:
+    --acars                 decode and display ACARS/SBD messages from IDA
+    --acars-json            output ACARS as JSON (airframes.io compatible)
+    --station=ID            station identifier for JSON output
+
 Output:
     --file-info=STR         file info string for RAW output (default: auto)
     --parsed                output parsed IDA lines (bypass iridium-parser.py)
@@ -525,3 +621,4 @@ This project builds on the work of several open-source projects:
 - [ice9-bluetooth-sniffer](https://github.com/mikeryan/ice9-bluetooth-sniffer) (GPL-2.0) by Mike Ryan / ICE9 Consulting LLC -- the SDR backend abstraction, build system, and threading infrastructure are adapted from this project
 - [VkFFT](https://github.com/DTolm/VkFFT) (MIT) by Dmitrii Tolmachev -- header-only GPU FFT library used for both OpenCL and Vulkan burst detection
 - [iridium-toolkit](https://github.com/muccc/iridium-toolkit) (BSD-2-Clause) by Sec and schneider42 -- the downstream frame parser and reassembler, and the reference implementation for BCH error correction and de-interleaving algorithms
+- [libacars](https://github.com/szpajder/libacars) (MIT) by Tomasz Lemiech (szpajder) -- optional dependency for ARINC-622, ADS-C, and CPDLC decoding within ACARS messages
