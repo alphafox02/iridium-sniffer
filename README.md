@@ -385,6 +385,37 @@ or:
 -- libacars: not found (basic ACARS only)
 ```
 
+### Feeding airframes.io
+
+The traditional Python pipeline for getting Iridium ACARS into [airframes.io](https://airframes.io) requires four processes chained together:
+
+```bash
+# Traditional pipeline (gr-iridium + iridium-toolkit + acars.py)
+iridium-extractor -D 4 rtl-sdr | iridium-parser.py | reassembler.py -m acars -a json | acars.py -s MYSTATION -u udp://feed.airframes.io:5555
+```
+
+Or with iridium-sniffer replacing gr-iridium but still using the Python pipeline:
+
+```bash
+# iridium-sniffer + Python pipeline
+./iridium-sniffer -l -i soapy-0 --parsed | reassembler.py -m acars -a json | acars.py -s MYSTATION -u udp://feed.airframes.io:5555
+```
+
+With built-in ACARS decoding and UDP streaming, the entire pipeline collapses to a single command:
+
+```bash
+# Single binary, no Python, no pipes
+./iridium-sniffer -l -i soapy-0 --acars-udp=feed.airframes.io:5555 --station=MYSTATION
+```
+
+Add `--acars` to also see human-readable text output locally while feeding the remote aggregator:
+
+```bash
+./iridium-sniffer -l -i soapy-0 --acars --acars-udp=feed.airframes.io:5555 --station=MYSTATION
+```
+
+The JSON format is compatible with the existing airframes.io ingestion pipeline. When libacars is installed, decoded ARINC-622 application payloads (ADS-C position reports, CPDLC clearances, OHMA) are included as additional structured fields in the JSON output.
+
 ## Parsed IDA Output
 
 The `--parsed` flag enables internal IDA frame decoding with Chase BCH error correction and outputs parsed IDA lines directly to stdout. This was added primarily for recovering ACARS, SBD, and other IDA-based message content without requiring the external Python `iridium-parser.py` pipeline.
