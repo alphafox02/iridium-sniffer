@@ -17,6 +17,7 @@ Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames direct
 - Gardner timing recovery (enabled by default) for improved weak burst demodulation
 - Native GSMTAP/LAPDm output to Wireshark (`--gsmtap`) for IDA frame analysis
 - Built-in web map with live satellite and ring alert visualization
+- Doppler-based receiver positioning from decoded satellite signals (`--position`)
 - GPU-accelerated FFT burst detection (OpenCL or Vulkan)
 - Multi-threaded architecture: detection, downmix pool, demodulation, stats
 - HackRF, BladeRF, USRP, and SoapySDR support
@@ -141,6 +142,12 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 # Direct ACARS/SBD recovery (bypasses iridium-parser.py)
 ./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
+# Estimate receiver position from Doppler shift (with web map)
+./iridium-sniffer -l -i soapy-0 --position
+
+# Position with height aiding (100m above sea level)
+./iridium-sniffer -l -i soapy-0 --position=100
+
 # Send IDA frames to Wireshark
 ./iridium-sniffer -l -i soapy-0 --gsmtap
 ```
@@ -154,26 +161,26 @@ Tested against gr-iridium on a 60-second IQ recording (cf32, 10 MHz, 1622 MHz ce
 | Metric | iridium-sniffer | gr-iridium |
 |--------|-----------------|------------|
 | Detected bursts | 5468 | ~3666 |
-| Demodulated RAW frames | 3228 | 2713 |
-| Ok rate | 60% | 74% |
-| IDA frames (internal `--parsed`) | 693 | -- |
-| IDA frames (external iridium-parser.py) | 507 | 690 |
+| Demodulated RAW frames | 3701 | 2713 |
+| Ok rate | 68% | 74% |
+| IDA frames (internal `--parsed`) | 743 | -- |
+| IDA frames (external iridium-parser.py) | 373 | 690 |
 
-The default 16 dB threshold detects more bursts than gr-iridium, including weaker signals at the noise floor. Many of these marginal bursts fail demodulation, which lowers the ok percentage -- but the absolute frame count is 19% higher (3228 vs 2713). This is the recommended setting for maximum data recovery.
+The default 16 dB threshold detects more bursts than gr-iridium, including weaker signals at the noise floor. Many of these marginal bursts fail demodulation, which lowers the ok percentage -- but the absolute frame count is 36% higher (3701 vs 2713). This is the recommended setting for maximum data recovery.
 
 **Matched threshold (18 dB) -- apples-to-apples comparison:**
 
 | Metric | iridium-sniffer | gr-iridium |
 |--------|-----------------|------------|
 | Detected bursts | 3668 | ~3666 |
-| Demodulated RAW frames | 2559 | 2713 |
-| Ok rate | 70% | 74% |
-| IDA frames (internal `--parsed`) | 576 | -- |
-| IDA frames (external iridium-parser.py) | 464 | 690 |
+| Demodulated RAW frames | 2737 | 2713 |
+| Ok rate | 75% | 74% |
+| IDA frames (internal `--parsed`) | 605 | -- |
+| IDA frames (external iridium-parser.py) | 361 | 690 |
 
-At 18 dB (gr-iridium's default), burst detection counts are nearly identical. The ok rate gap narrows to 70% vs 74%. The external parser IDA gap (464 vs 690) reflects that gr-iridium's GNU Radio-based demodulator produces cleaner bits -- more frames survive standard BCH correction. Chase soft-decision decoding in `--parsed` mode compensates for this (576 vs 464), but the demodulator quality gap is the area with the most room for improvement. Use `--threshold=18` if ok rate percentage is more important than total frame count.
+At 18 dB (gr-iridium's default), burst detection counts are nearly identical. The ok rate now matches gr-iridium at 75% vs 74%. The external parser IDA gap (361 vs 690) reflects that gr-iridium's GNU Radio-based demodulator produces cleaner bits -- more frames survive standard BCH correction. Chase soft-decision decoding in `--parsed` mode compensates for this (605 vs 361), recovering nearly as many IDA frames from noisier bits. Use `--threshold=18` if ok rate percentage is more important than total frame count.
 
-**A note on live ok% rates:** In live SDR capture, you may see ok\_avg of 25-40% with iridium-sniffer compared to 70-80% shown in gr-iridium guides. This is expected and not a problem. iridium-sniffer uses a lower default detection threshold (16 dB vs gr-iridium's 18 dB), which catches more weak bursts at the noise floor. These marginal detections lower the ok percentage but increase the total number of successfully decoded frames. The ok% statistic measures what fraction of detected bursts decode -- not how many frames you are actually recovering. What matters is decoded frames per second, and iridium-sniffer typically recovers more usable data than gr-iridium despite the lower ok% figure.
+**A note on live ok% rates:** In live SDR capture, you may see ok\_avg of 35-50% with iridium-sniffer compared to 70-80% shown in gr-iridium guides. This is expected and not a problem. iridium-sniffer uses a lower default detection threshold (16 dB vs gr-iridium's 18 dB), which catches more weak bursts at the noise floor. These marginal detections lower the ok percentage but increase the total number of successfully decoded frames. The ok% statistic measures what fraction of detected bursts decode -- not how many frames you are actually recovering. What matters is decoded frames per second, and iridium-sniffer typically recovers more usable data than gr-iridium despite the lower ok% figure.
 
 **Processing speed (60s cf32 file, i7-11800H):**
 
@@ -226,6 +233,24 @@ The web map runs alongside normal RAW output. Adding `--web` does not change wha
 ```bash
 ./iridium-sniffer -l -i soapy-0 --web | python3 iridium-toolkit/iridium-parser.py
 ```
+
+## Doppler Positioning (Experimental)
+
+The `--position` flag enables receiver geolocation from Doppler shift measurements. As Iridium LEO satellites pass overhead at ~7.5 km/s, each decoded burst's frequency offset encodes the satellite-receiver geometry. By collecting measurements from multiple satellite passes, an iterated weighted least-squares solver estimates the receiver's latitude and longitude -- no GPS required.
+
+```bash
+# Basic positioning (implies --web for map display)
+./iridium-sniffer -l -i soapy-0 --position
+
+# With height aiding for better accuracy (altitude in meters above sea level)
+./iridium-sniffer -l -i soapy-0 --position=100
+```
+
+The solver runs every 10 seconds and requires at least 5 measurements from 2+ satellites before attempting a solution. Position estimates appear on stderr and as a green marker on the web map. With open sky and height aiding, expect convergence within 5-10 minutes. Accuracy improves with more satellite passes -- the solver uses motion-validated spatial clustering to reject corrupted IRA positions and outlier rejection (3-sigma) to filter bad measurements.
+
+Height aiding constrains the altitude to a known value and significantly improves horizontal accuracy. Without it, the vertical component is poorly determined by Doppler-only measurements.
+
+Based on: Z. Tan et al., "New Method for Positioning Using IRIDIUM Satellite Signals of Opportunity," IEEE Access, vol. 7, 2019.
 
 ## GSMTAP Output (Wireshark Integration)
 

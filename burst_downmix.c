@@ -56,7 +56,7 @@ extern int verbose;
 #define RRC_NTAPS           51
 #define RC_NTAPS            51
 #define RRC_ALPHA           0.4f
-#define START_THRESHOLD     0.28f
+#define START_THRESHOLD     0.45f
 #define PRE_START_US        100  /* microseconds before burst start */
 
 /* ---- Internal state ---- */
