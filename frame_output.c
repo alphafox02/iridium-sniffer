@@ -30,6 +30,7 @@
 
 extern int diagnostic_mode;
 extern int parsed_mode;
+extern int acars_enabled;
 
 static const char *out_file_info = NULL;
 static uint64_t t0 = 0;
@@ -42,8 +43,8 @@ void frame_output_init(const char *fi)
 
 void frame_output_print(demod_frame_t *frame)
 {
-    /* Suppress RAW output in diagnostic mode */
-    if (diagnostic_mode)
+    /* Suppress RAW output in diagnostic or ACARS-only mode */
+    if (diagnostic_mode || acars_enabled)
         return;
 
     /* Auto-initialize t0 from first frame timestamp */

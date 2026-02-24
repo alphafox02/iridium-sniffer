@@ -24,6 +24,9 @@ void acars_ida_cb(const uint8_t *data, int len,
                   ir_direction_t direction, float magnitude,
                   void *user);
 
+/* Print SBD/ACARS stats summary to stderr. */
+void acars_print_stats(void);
+
 /* Output mode (set before first callback) */
 extern int acars_json;
 

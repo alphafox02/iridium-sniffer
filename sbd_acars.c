@@ -22,6 +22,18 @@
 int acars_json = 0;
 static const char *station = NULL;
 
+/* ---- Stats counters ---- */
+
+static int stat_ida_total = 0;      /* total IDA messages received */
+static int stat_sbd_total = 0;      /* SBD packets identified */
+static int stat_sbd_short = 0;      /* short/mboxcheck messages */
+static int stat_sbd_single = 0;     /* single-packet messages */
+static int stat_sbd_multi_ok = 0;   /* completed multi-packet messages */
+static int stat_sbd_multi_frag = 0; /* multi-packet fragments processed */
+static int stat_sbd_broken = 0;     /* orphan/expired fragments */
+static int stat_acars_total = 0;    /* ACARS messages decoded */
+static int stat_acars_errors = 0;   /* ACARS with CRC/parity errors */
+
 /* ---- Timestamp handling ---- */
 
 static struct timespec wall_t0;
@@ -431,7 +443,11 @@ static void acars_parse(const uint8_t *data, int len, int ul,
 
     int errors = crc_errors + (!parity_ok);
 
-    /* Skip messages with errors unless we're doing text output (show everything) */
+    stat_acars_total++;
+    if (errors > 0)
+        stat_acars_errors++;
+
+    /* Skip messages with errors in JSON mode */
     if (acars_json && errors > 0)
         return;
 
@@ -445,11 +461,42 @@ static void acars_parse(const uint8_t *data, int len, int ul,
 
 /* ---- SBD extraction ---- */
 
+static void sbd_output_raw(const uint8_t *data, int len, int ul,
+                            uint64_t timestamp, double frequency)
+{
+    if (acars_json)
+        return;
+
+    char ts_buf[32];
+    format_timestamp(timestamp, ts_buf, sizeof(ts_buf));
+
+    printf("SBD: %s %s ", ts_buf, ul ? "UL" : "DL");
+    for (int i = 0; i < len && i < 64; i++)
+        printf("%02x", data[i]);
+    if (len > 64)
+        printf("...");
+    printf(" | ");
+    for (int i = 0; i < len && i < 64; i++) {
+        char c = (char)data[i];
+        printf("%c", (c >= 0x20 && c < 0x7f) ? c : '.');
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
 static void sbd_process(const uint8_t *sbd_data, int sbd_len, int ul,
                          uint64_t timestamp, double frequency,
                          float magnitude)
 {
-    acars_parse(sbd_data, sbd_len, ul, timestamp, frequency, magnitude);
+    /* Try ACARS first */
+    if (sbd_len > 0 && sbd_data[0] == 0x01 && sbd_len > 2) {
+        acars_parse(sbd_data, sbd_len, ul, timestamp, frequency, magnitude);
+        return;
+    }
+
+    /* Non-ACARS SBD: show raw in text mode */
+    if (sbd_len > 0)
+        sbd_output_raw(sbd_data, sbd_len, ul, timestamp, frequency);
 }
 
 static void sbd_expire(uint64_t now_ns)
@@ -487,6 +534,8 @@ static void sbd_extract(const uint8_t *data, int len, int ul,
 
     if (!is_sbd)
         return;
+
+    stat_sbd_total++;
 
     uint8_t typ0 = data[0];
     uint8_t typ1 = data[1];
@@ -569,10 +618,12 @@ static void sbd_extract(const uint8_t *data, int len, int ul,
 
     if (msgno == 0) {
         /* Short/mboxcheck message */
+        stat_sbd_short++;
         if (sbd_len > 0)
             sbd_process(sbd_data, sbd_len, ul, timestamp, frequency, magnitude);
     } else if (msgcnt == 1 && msgno == 1) {
         /* Single complete message */
+        stat_sbd_single++;
         sbd_process(sbd_data, sbd_len, ul, timestamp, frequency, magnitude);
     } else if (msgcnt > 1) {
         /* First packet of multi-packet message -- store */
@@ -620,8 +671,10 @@ static void sbd_extract(const uint8_t *data, int len, int ul,
             s->msgno = msgno;
             s->timestamp = timestamp;
 
+            stat_sbd_multi_frag++;
             if (msgno == s->msgcnt) {
                 /* Complete -- process and free slot */
+                stat_sbd_multi_ok++;
                 sbd_process(s->data, s->data_len, ul, timestamp,
                             s->frequency, s->magnitude);
                 s->active = 0;
@@ -629,6 +682,7 @@ static void sbd_extract(const uint8_t *data, int len, int ul,
             return;
         }
         /* No matching slot -- orphan fragment, discard */
+        stat_sbd_broken++;
     }
 }
 
@@ -648,6 +702,22 @@ void acars_ida_cb(const uint8_t *data, int len,
                   void *user)
 {
     (void)user;
+    stat_ida_total++;
     int ul = (direction == DIR_UPLINK) ? 1 : 0;
     sbd_extract(data, len, ul, timestamp, frequency, magnitude);
+}
+
+void acars_print_stats(void)
+{
+    fprintf(stderr, "SBD: %d packets from %d IDA messages "
+            "(%d short, %d single, %d multi-pkt)\n",
+            stat_sbd_total, stat_ida_total,
+            stat_sbd_short, stat_sbd_single, stat_sbd_multi_ok);
+    if (stat_sbd_multi_frag > 0 || stat_sbd_broken > 0)
+        fprintf(stderr, "SBD: %d multi-pkt fragments, %d broken/orphan\n",
+                stat_sbd_multi_frag, stat_sbd_broken);
+    fprintf(stderr, "ACARS: %d messages decoded", stat_acars_total);
+    if (stat_acars_errors > 0)
+        fprintf(stderr, " (%d with errors)", stat_acars_errors);
+    fprintf(stderr, "\n");
 }
