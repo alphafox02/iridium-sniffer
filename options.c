@@ -53,6 +53,11 @@ extern char *usrp_serial;
 #endif
 #ifdef HAVE_SOAPYSDR
 extern int soapy_num;
+extern char *soapy_args;
+#define SOAPY_SETTINGS_MAX 8
+extern char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_setting_count;
 #endif
 
 extern int hackrf_lna_gain;
@@ -99,7 +104,9 @@ static void usage(int exitcode) {
 "    --format=FMT            IQ file format: ci8 (default), ci16, cf32\n"
 "\n"
 "SDR options:\n"
-"    -i, --interface=IFACE   SDR to use: soapy-N, hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL\n"
+"    -i, --interface=IFACE   SDR to use (see --list for available devices):\n"
+"                             soapy-N (by index) or soapy:driver=X,serial=Y (by args)\n"
+"                             hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL\n"
 "    -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)\n"
 "    -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)\n"
 "    -B, --bias-tee           enable bias tee power\n"
@@ -111,6 +118,8 @@ static void usage(int exitcode) {
 "    --bladerf-gain=GAIN     BladeRF gain in dB (default: 40)\n"
 "    --usrp-gain=GAIN        USRP gain in dB (default: 40)\n"
 "    --soapy-gain=GAIN       SoapySDR gain in dB (default: 30)\n"
+"    --soapy-setting=K:V    SoapySDR device setting (repeatable)\n"
+"                             e.g. bitpack:true (Airspy), biastee_rx:true (bladeRF)\n"
 "\n"
 "Detection options:\n"
 "    -d, --threshold=DB      burst detection threshold in dB (default: 16.0)\n"
@@ -198,6 +207,7 @@ void parse_options(int argc, char **argv) {
         OPT_ACARS_UDP,
         OPT_FEED,
         OPT_STATION,
+        OPT_SOAPY_SETTING,
     };
 
     static const struct option longopts[] = {
@@ -234,6 +244,7 @@ void parse_options(int argc, char **argv) {
         { "acars-udp",      required_argument, NULL, OPT_ACARS_UDP },
         { "feed",           optional_argument, NULL, OPT_FEED },
         { "station",        required_argument, NULL, OPT_STATION },
+        { "soapy-setting",  required_argument, NULL, OPT_SOAPY_SETTING },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -270,6 +281,10 @@ void parse_options(int argc, char **argv) {
                 }
 #endif
 #ifdef HAVE_SOAPYSDR
+                if (strstr(optarg, "soapy:") == optarg) {
+                    soapy_args = strdup(optarg + 6);
+                    break;
+                }
                 if (strstr(optarg, "soapy-") == optarg) {
                     soapy_num = atoi(optarg + 6);
                     break;
@@ -445,6 +460,26 @@ void parse_options(int argc, char **argv) {
                 station_id = strdup(optarg);
                 break;
 
+            case OPT_SOAPY_SETTING:
+#ifdef HAVE_SOAPYSDR
+                if (soapy_setting_count >= SOAPY_SETTINGS_MAX)
+                    errx(1, "Too many --soapy-setting options (max %d)",
+                         SOAPY_SETTINGS_MAX);
+                {
+                    char *colon = strchr(optarg, ':');
+                    if (!colon)
+                        errx(1, "--soapy-setting requires KEY:VALUE "
+                             "(e.g. bitpack:true)");
+                    *colon = '\0';
+                    soapy_setting_keys[soapy_setting_count] = strdup(optarg);
+                    soapy_setting_vals[soapy_setting_count] = strdup(colon + 1);
+                    soapy_setting_count++;
+                }
+#else
+                errx(1, "--soapy-setting requires SoapySDR support");
+#endif
+                break;
+
             case 'h':
                 usage(0);
                 break;
@@ -465,7 +500,7 @@ void parse_options(int argc, char **argv) {
         || usrp_serial
 #endif
 #ifdef HAVE_SOAPYSDR
-        || soapy_num >= 0
+        || soapy_num >= 0 || soapy_args
 #endif
     )
         live = 1;

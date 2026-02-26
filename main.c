@@ -109,6 +109,11 @@ char *usrp_serial = NULL;
 #endif
 #ifdef HAVE_SOAPYSDR
 int soapy_num = -1;
+char *soapy_args = NULL;
+#define SOAPY_SETTINGS_MAX 8
+char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
+char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
+int soapy_setting_count = 0;
 #endif
 
 /* Per-SDR gain settings (defaults from gr-iridium example configs) */
@@ -681,8 +686,8 @@ int main(int argc, char **argv) {
         }
 #endif
 #ifdef HAVE_SOAPYSDR
-        if (!sdr_started && soapy_num >= 0) {
-            soapy = soapy_setup(soapy_num);
+        if (!sdr_started && (soapy_num >= 0 || soapy_args)) {
+            soapy = soapy_setup(soapy_num, soapy_args);
             pthread_create(&soapy_thread, NULL, soapy_stream_thread, (void *)soapy);
             sdr_started = 1;
         }

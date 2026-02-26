@@ -586,11 +586,15 @@ Specifying `-i` selects an SDR interface and implies live capture (no `-l` neede
 ./iridium-sniffer --list
 ```
 
-Then specify the interface with `-i`:
+Then specify the interface with `-i`. SoapySDR devices can be selected by index (`soapy-N`) or by device args (`soapy:driver=X,serial=Y`) for deterministic selection when multiple devices are connected:
 
 ```bash
-# RTL-SDR / Airspy / other SoapySDR devices
+# RTL-SDR / Airspy / other SoapySDR devices (by index)
 ./iridium-sniffer -i soapy-0
+
+# SoapySDR device by serial number or driver args
+./iridium-sniffer -i soapy:driver=airspy,serial=ABC123
+./iridium-sniffer -i soapy:driver=rtlsdr,serial=00000001
 
 # HackRF (use serial from --list)
 ./iridium-sniffer -i hackrf-SERIAL
@@ -605,6 +609,10 @@ Then specify the interface with `-i`:
 ./iridium-sniffer -i soapy-0 -B --soapy-gain=40
 ./iridium-sniffer -i hackrf-SERIAL --hackrf-lna=40 --hackrf-vga=20
 ./iridium-sniffer -i usrp-PRODUCT-SERIAL --usrp-gain=50
+
+# SoapySDR device-specific settings
+./iridium-sniffer -i soapy:driver=airspy,serial=ABC --soapy-setting=bitpack:true
+./iridium-sniffer -i soapy:driver=bladerf --soapy-setting=biastee_rx:true
 ```
 
 ### Piping to iridium-toolkit
@@ -634,8 +642,9 @@ Input (one required):
                              Auto-detected from file extension when not specified
 
 SDR options:
-    -i, --interface=IFACE   SDR to use (required for -l):
-                             soapy-N, hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL
+    -i, --interface=IFACE   SDR to use (see --list for available devices):
+                             soapy-N (by index) or soapy:key=val,... (by args)
+                             hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL
     -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)
     -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)
     -B, --bias-tee          enable bias tee power
@@ -647,6 +656,8 @@ Gain options:
     --bladerf-gain=GAIN     BladeRF gain in dB (default: 40)
     --usrp-gain=GAIN        USRP gain in dB (default: 40)
     --soapy-gain=GAIN       SoapySDR gain in dB (default: 40)
+    --soapy-setting=K:V    SoapySDR device setting (repeatable)
+                             e.g. bitpack:true (Airspy), biastee_rx:true (bladeRF)
 
 Detection:
     -d, --threshold=DB      burst detection threshold in dB (default: 16.0)

@@ -25,6 +25,11 @@ extern double soapy_gain_val;
 extern int bias_tee;
 extern int verbose;
 
+#define SOAPY_SETTINGS_MAX 8
+extern char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_setting_count;
+
 static int sample_mode = 0;  /* 0=CS8, 1=CF32, 2=CS16 (fallback) */
 
 void soapy_list(void) {
@@ -34,12 +39,15 @@ void soapy_list(void) {
     for (size_t i = 0; i < length; ++i) {
         char *driver = NULL;
         char *label = NULL;
+        char *dev_serial = NULL;
 
         for (size_t j = 0; j < results[i].size; ++j) {
             if (strcmp(results[i].keys[j], "driver") == 0)
                 driver = results[i].vals[j];
             if (strcmp(results[i].keys[j], "label") == 0)
                 label = results[i].vals[j];
+            if (strcmp(results[i].keys[j], "serial") == 0)
+                dev_serial = results[i].vals[j];
         }
 
         printf("interface {value=soapy-%zu}{display=Iridium Sniffer (%s%s%s)}\n",
@@ -47,29 +55,54 @@ void soapy_list(void) {
                driver ? driver : "SoapySDR",
                label ? " - " : "",
                label ? label : "");
+
+        /* Show device args for soapy: selection */
+        if (driver || dev_serial) {
+            printf("         soapy:");
+            int first = 1;
+            if (driver) {
+                printf("driver=%s", driver);
+                first = 0;
+            }
+            if (dev_serial) {
+                printf("%sserial=%s", first ? "" : ",", dev_serial);
+            }
+            printf("\n");
+        }
     }
 
     SoapySDRKwargsList_clear(results, length);
 }
 
-SoapySDRDevice *soapy_setup(int id) {
+SoapySDRDevice *soapy_setup(int id, const char *args) {
     SoapySDRDevice *device;
-    size_t length;
     char **formats;
     size_t num_formats;
 
-    SoapySDRKwargs *results = SoapySDRDevice_enumerate(NULL, &length);
+    if (args) {
+        /* Device args mode: pass directly to SoapySDR */
+        device = SoapySDRDevice_makeStrArgs(args);
+        if (device == NULL)
+            errx(1, "Unable to open SoapySDR device with args '%s': %s",
+                 args, SoapySDRDevice_lastError());
+        if (verbose)
+            fprintf(stderr, "SoapySDR: opened device with args: %s\n", args);
+    } else {
+        /* Index mode: enumerate and pick by index */
+        size_t length;
+        SoapySDRKwargs *results = SoapySDRDevice_enumerate(NULL, &length);
 
-    if (id < 0 || (size_t)id >= length) {
+        if (id < 0 || (size_t)id >= length) {
+            SoapySDRKwargsList_clear(results, length);
+            errx(1, "Invalid SoapySDR device index: %d (found %zu devices)", id, length);
+        }
+
+        device = SoapySDRDevice_make(&results[id]);
         SoapySDRKwargsList_clear(results, length);
-        errx(1, "Invalid SoapySDR device index: %d (found %zu devices)", id, length);
+
+        if (device == NULL)
+            errx(1, "Unable to open SoapySDR device: %s", SoapySDRDevice_lastError());
     }
-
-    device = SoapySDRDevice_make(&results[id]);
-    SoapySDRKwargsList_clear(results, length);
-
-    if (device == NULL)
-        errx(1, "Unable to open SoapySDR device: %s", SoapySDRDevice_lastError());
 
     /* Check supported formats: prefer CS8, then CF32, then CS16 */
     formats = SoapySDRDevice_getStreamFormats(device, SOAPY_SDR_RX, 0, &num_formats);
@@ -106,9 +139,51 @@ SoapySDRDevice *soapy_setup(int id) {
     }
 
     if (bias_tee) {
-        if (SoapySDRDevice_writeSetting(device, "biastee", "true") != 0) {
+        /* Find the correct bias tee setting key for this device.
+         * Different SoapySDR drivers use different names:
+         * Airspy/RTL-SDR: "biastee", bladeRF: "biastee_rx", HackRF: "bias_tx" */
+        size_t num_settings;
+        SoapySDRArgInfo *settings = SoapySDRDevice_getSettingInfo(device, &num_settings);
+        int found = 0;
+        for (size_t i = 0; i < num_settings; ++i) {
+            if (strstr(settings[i].key, "bias") && strstr(settings[i].key, "rx")) {
+                /* Prefer RX-specific bias tee (e.g. biastee_rx) */
+                SoapySDRDevice_writeSetting(device, settings[i].key, "true");
+                if (verbose)
+                    fprintf(stderr, "SoapySDR: enabled bias tee via %s\n", settings[i].key);
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            for (size_t i = 0; i < num_settings; ++i) {
+                if (strstr(settings[i].key, "bias") &&
+                    !strstr(settings[i].key, "tx")) {
+                    SoapySDRDevice_writeSetting(device, settings[i].key, "true");
+                    if (verbose)
+                        fprintf(stderr, "SoapySDR: enabled bias tee via %s\n",
+                                settings[i].key);
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        for (size_t i = 0; i < num_settings; ++i)
+            SoapySDRArgInfo_clear(&settings[i]);
+        free(settings);
+        if (!found && verbose)
+            warnx("No bias tee setting found for this SoapySDR device");
+    }
+
+    for (int i = 0; i < soapy_setting_count; ++i) {
+        if (SoapySDRDevice_writeSetting(device, soapy_setting_keys[i],
+                                        soapy_setting_vals[i]) != 0) {
             if (verbose)
-                warnx("Unable to enable SoapySDR bias tee (continuing anyway)");
+                warnx("Unable to set SoapySDR setting %s=%s (continuing anyway)",
+                      soapy_setting_keys[i], soapy_setting_vals[i]);
+        } else if (verbose) {
+            fprintf(stderr, "SoapySDR: set %s=%s\n",
+                    soapy_setting_keys[i], soapy_setting_vals[i]);
         }
     }
 
