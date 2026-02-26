@@ -89,13 +89,13 @@ extern int feed_tcp_port;
 
 static void usage(int exitcode) {
     fprintf(stderr,
-"Usage: iridium-sniffer <-f FILE | -l> [options]\n"
+"Usage: iridium-sniffer <-f FILE | -i IFACE> [options]\n"
 "Standalone Iridium satellite burst detector and demodulator.\n"
 "Outputs iridium-toolkit compatible RAW format to stdout.\n"
 "\n"
 "Input (one required):\n"
 "    -f, --file=FILE         read IQ samples from file\n"
-"    -l, --live              capture live from SDR (requires -i)\n"
+"    -l, --live              capture live from SDR (implied by -i)\n"
 "    --format=FMT            IQ file format: ci8 (default), ci16, cf32\n"
 "\n"
 "SDR options:\n"
@@ -455,6 +455,20 @@ void parse_options(int argc, char **argv) {
                 break;
         }
     }
+
+    /* -i implies live capture */
+    if (serial
+#ifdef HAVE_BLADERF
+        || bladerf_num >= 0
+#endif
+#ifdef HAVE_UHD
+        || usrp_serial
+#endif
+#ifdef HAVE_SOAPYSDR
+        || soapy_num >= 0
+#endif
+    )
+        live = 1;
 
     if (!live && in_file == NULL)
         usage(1);

@@ -133,45 +133,45 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 ./iridium-sniffer --list
 
 # Live capture (specify your SDR with -i)
-./iridium-sniffer -l -i soapy-0                          # RTL-SDR, Airspy, etc.
-./iridium-sniffer -l -i hackrf-SERIAL                # HackRF
-./iridium-sniffer -l -i usrp-PRODUCT-SERIAL             # USRP
+./iridium-sniffer -i soapy-0                          # RTL-SDR, Airspy, etc.
+./iridium-sniffer -i hackrf-SERIAL                # HackRF
+./iridium-sniffer -i usrp-PRODUCT-SERIAL             # USRP
 
 # Live capture with web map (open http://localhost:8888)
-./iridium-sniffer -l -i soapy-0 --web
+./iridium-sniffer -i soapy-0 --web
 
 # Process an IQ recording (no -i needed)
 ./iridium-sniffer -f recording.cf32
 
 # Pipe to iridium-toolkit
-./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
 
 # Built-in ACARS/SBD decoding (no Python needed)
-./iridium-sniffer -l -i soapy-0 --acars
+./iridium-sniffer -i soapy-0 --acars
 
 # ACARS JSON to stdout (dumpvdl2/dumphfdl compatible format)
-./iridium-sniffer -l -i soapy-0 --acars-json --station=MYSTATION
+./iridium-sniffer -i soapy-0 --acars-json --station=MYSTATION
 
 # Feed airframes.io directly (iridium-toolkit JSON format over TCP)
-./iridium-sniffer -l -i soapy-0 --feed --station=MYSTATION
+./iridium-sniffer -i soapy-0 --feed --station=MYSTATION
 
 # Feed acarshub via UDP (iridium-toolkit JSON format)
-./iridium-sniffer -l -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
+./iridium-sniffer -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
 
 # Stream JSON via UDP (dumpvdl2 format, for future aggregator support)
-./iridium-sniffer -l -i soapy-0 --acars-udp=192.168.1.100:5555 --station=MYSTATION
+./iridium-sniffer -i soapy-0 --acars-udp=192.168.1.100:5555 --station=MYSTATION
 
 # Direct ACARS/SBD recovery via iridium-toolkit (bypasses iridium-parser.py)
-./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # Estimate receiver position from Doppler shift (with web map)
-./iridium-sniffer -l -i soapy-0 --position
+./iridium-sniffer -i soapy-0 --position
 
 # Position with height aiding (100m above sea level)
-./iridium-sniffer -l -i soapy-0 --position=100
+./iridium-sniffer -i soapy-0 --position=100
 
 # Send IDA frames to Wireshark
-./iridium-sniffer -l -i soapy-0 --gsmtap
+./iridium-sniffer -i soapy-0 --gsmtap
 ```
 
 ## Performance
@@ -227,10 +227,10 @@ The `--web` flag starts an embedded HTTP server that decodes IRA (ring alert) an
 
 ```bash
 # Default port 8888
-./iridium-sniffer -l -i soapy-0 --web
+./iridium-sniffer -i soapy-0 --web
 
 # Custom port
-./iridium-sniffer -l -i soapy-0 --web=9090
+./iridium-sniffer -i soapy-0 --web=9090
 ```
 
 Then open `http://localhost:8888` in a browser.
@@ -253,7 +253,7 @@ Data updates once per second via Server-Sent Events. The map uses Leaflet.js wit
 The web map runs alongside normal RAW output. Adding `--web` does not change what appears on stdout, so you can pipe to iridium-toolkit at the same time:
 
 ```bash
-./iridium-sniffer -l -i soapy-0 --web | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -i soapy-0 --web | python3 iridium-toolkit/iridium-parser.py
 ```
 
 ## Doppler Positioning (Experimental)
@@ -262,10 +262,10 @@ The `--position` flag enables receiver geolocation from Doppler shift measuremen
 
 ```bash
 # Basic positioning (implies --web for map display)
-./iridium-sniffer -l -i soapy-0 --position
+./iridium-sniffer -i soapy-0 --position
 
 # With height aiding for better accuracy (altitude in meters above sea level)
-./iridium-sniffer -l -i soapy-0 --position=100
+./iridium-sniffer -i soapy-0 --position=100
 ```
 
 The solver runs every 10 seconds and requires at least 5 measurements from 2+ satellites before attempting a solution. Position estimates appear on stderr and as a green marker on the web map. With open sky and height aiding, expect convergence within 5-10 minutes. Accuracy improves with more satellite passes -- the solver uses motion-validated spatial clustering to reject corrupted IRA positions and outlier rejection (3-sigma) to filter bad measurements.
@@ -283,13 +283,13 @@ The `--gsmtap` flag enables native IDA (Iridium Data Access) frame decoding and 
 wireshark -k -i lo -f "udp port 4729"
 
 # In another terminal, run with GSMTAP enabled
-./iridium-sniffer -l -i soapy-0 --gsmtap
+./iridium-sniffer -i soapy-0 --gsmtap
 
 # Custom destination host and port
-./iridium-sniffer -l -i soapy-0 --gsmtap=192.168.1.100:4729
+./iridium-sniffer -i soapy-0 --gsmtap=192.168.1.100:4729
 
 # Combined with web map
-./iridium-sniffer -l -i soapy-0 --web --gsmtap
+./iridium-sniffer -i soapy-0 --web --gsmtap
 ```
 
 Wireshark decodes the packets as GSM/LAPDm signaling. Typical messages seen:
@@ -323,22 +323,22 @@ This replaces the `reassembler.py -m acars` pipeline entirely -- no Python neede
 
 ```bash
 # Human-readable text output
-./iridium-sniffer -l -i usrp-B210-SERIAL --acars
+./iridium-sniffer -i usrp-B210-SERIAL --acars
 
 # JSON output to stdout
-./iridium-sniffer -l -i usrp-B210-SERIAL --acars-json --station=MYSTATION
+./iridium-sniffer -i usrp-B210-SERIAL --acars-json --station=MYSTATION
 
 # Stream JSON over UDP to a remote aggregator
-./iridium-sniffer -l -i usrp-B210-SERIAL --acars-udp=192.168.1.100:5555 --station=MYSTATION
+./iridium-sniffer -i usrp-B210-SERIAL --acars-udp=192.168.1.100:5555 --station=MYSTATION
 
 # Feed acarshub via UDP (iridium-toolkit JSON format)
-./iridium-sniffer -l -i usrp-B210-SERIAL --feed=udp://127.0.0.1:5558 --station=MYSTATION
+./iridium-sniffer -i usrp-B210-SERIAL --feed=udp://127.0.0.1:5558 --station=MYSTATION
 
 # Feed airframes.io directly via TCP (iridium-toolkit JSON format)
-./iridium-sniffer -l -i usrp-B210-SERIAL --feed --station=MYSTATION
+./iridium-sniffer -i usrp-B210-SERIAL --feed --station=MYSTATION
 
 # Text on stdout + UDP JSON stream simultaneously
-./iridium-sniffer -l -i usrp-B210-SERIAL --acars --acars-udp=192.168.1.100:5555 --station=MYSTATION
+./iridium-sniffer -i usrp-B210-SERIAL --acars --acars-udp=192.168.1.100:5555 --station=MYSTATION
 ```
 
 ### Text Output
@@ -476,25 +476,25 @@ iridium-sniffer replaces that entire chain with a single `--feed` flag. The feed
 
 ```bash
 # Bare --feed defaults to tcp://feed.airframes.io:5590
-./iridium-sniffer -l -i soapy-0 --feed --station=MYSTATION
+./iridium-sniffer -i soapy-0 --feed --station=MYSTATION
 ```
 
 **Feed a local acarshub instance** (UDP, port 5558):
 
 ```bash
-./iridium-sniffer -l -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
+./iridium-sniffer -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
 ```
 
 **Feed acarshub via TCP** (also supported):
 
 ```bash
-./iridium-sniffer -l -i soapy-0 --feed=tcp://127.0.0.1:15590 --station=MYSTATION
+./iridium-sniffer -i soapy-0 --feed=tcp://127.0.0.1:15590 --station=MYSTATION
 ```
 
 Add `--acars` for human-readable text output locally while feeding:
 
 ```bash
-./iridium-sniffer -l -i soapy-0 --acars --feed --station=MYSTATION
+./iridium-sniffer -i soapy-0 --acars --feed --station=MYSTATION
 ```
 
 **Docker Compose (acarshub):** Set `ENABLE_IRDM=true` and configure the transport. For UDP: `IRDM_CONNECTIONS=udp` (default port 5558). For TCP: `IRDM_CONNECTIONS=tcp://HOST:PORT`. See the [docker-acarshub](https://github.com/sdr-enthusiasts/docker-acarshub) documentation for details.
@@ -511,10 +511,10 @@ The `--parsed` flag enables internal IDA frame decoding with Chase BCH error cor
 
 ```bash
 # Direct to reassembler (no iridium-parser.py needed for IDA/ACARS/SBD)
-./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # Traditional pipeline (still works, decodes all frame types)
-./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -i soapy-0 | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
 ```
 
 **Current capabilities and limitations:**
@@ -539,7 +539,7 @@ The `--save-bursts` option saves IQ samples from successfully decoded bursts to 
 
 ```bash
 # Save all decoded bursts
-./iridium-sniffer -l -i soapy-0 --save-bursts bursts/
+./iridium-sniffer -i soapy-0 --save-bursts bursts/
 
 # Process file and save bursts
 ./iridium-sniffer -f recording.cf32 --format=cf32 --save-bursts bursts/
@@ -580,7 +580,7 @@ The IQ format is auto-detected from the file extension (`.cf32`/`.fc32`/`.cfile`
 
 ### Live Capture
 
-Live capture requires `-i` to select an SDR interface. Use `--list` to see available devices:
+Specifying `-i` selects an SDR interface and implies live capture (no `-l` needed). Use `--list` to see available devices:
 
 ```bash
 ./iridium-sniffer --list
@@ -590,31 +590,31 @@ Then specify the interface with `-i`:
 
 ```bash
 # RTL-SDR / Airspy / other SoapySDR devices
-./iridium-sniffer -l -i soapy-0
+./iridium-sniffer -i soapy-0
 
 # HackRF (use serial from --list)
-./iridium-sniffer -l -i hackrf-SERIAL
+./iridium-sniffer -i hackrf-SERIAL
 
 # USRP (use serial from --list)
-./iridium-sniffer -l -i usrp-PRODUCT-SERIAL
+./iridium-sniffer -i usrp-PRODUCT-SERIAL
 
 # BladeRF
-./iridium-sniffer -l -i bladerf1
+./iridium-sniffer -i bladerf1
 
 # With gain and bias tee
-./iridium-sniffer -l -i soapy-0 -B --soapy-gain=40
-./iridium-sniffer -l -i hackrf-SERIAL --hackrf-lna=40 --hackrf-vga=20
-./iridium-sniffer -l -i usrp-PRODUCT-SERIAL --usrp-gain=50
+./iridium-sniffer -i soapy-0 -B --soapy-gain=40
+./iridium-sniffer -i hackrf-SERIAL --hackrf-lna=40 --hackrf-vga=20
+./iridium-sniffer -i usrp-PRODUCT-SERIAL --usrp-gain=50
 ```
 
 ### Piping to iridium-toolkit
 
 ```bash
 # Real-time decode
-./iridium-sniffer -l -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
+./iridium-sniffer -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
 
 # Direct to reassembler (parsed mode, bypasses iridium-parser.py)
-./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
+./iridium-sniffer -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
 # File processing with full reassembly (traditional pipeline)
 ./iridium-sniffer -f recording.cf32 --format cf32 | \
@@ -625,11 +625,11 @@ Then specify the interface with `-i`:
 ## Command Reference
 
 ```
-Usage: iridium-sniffer <-f FILE | -l> [options]
+Usage: iridium-sniffer <-f FILE | -i IFACE> [options]
 
 Input (one required):
     -f, --file=FILE         read IQ samples from file
-    -l, --live              capture live from SDR (requires -i)
+    -l, --live              capture live from SDR (implied by -i)
     --format=FMT            IQ file format: ci8 (default), ci16, cf32
                              Auto-detected from file extension when not specified
 
