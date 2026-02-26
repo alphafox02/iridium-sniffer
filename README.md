@@ -152,6 +152,12 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 # ACARS JSON to stdout (dumpvdl2/dumphfdl compatible format)
 ./iridium-sniffer -l -i soapy-0 --acars-json --station=MYSTATION
 
+# Feed airframes.io / acarshub (iridium-toolkit compat format)
+./iridium-sniffer -l -i soapy-0 --acarshub=feed.airframes.io:5555 --station=MYSTATION
+
+# Stream JSON via UDP (dumpvdl2 format, for future aggregator support)
+./iridium-sniffer -l -i soapy-0 --acars-udp=192.168.1.100:5555 --station=MYSTATION
+
 # Direct ACARS/SBD recovery via iridium-toolkit (bypasses iridium-parser.py)
 ./iridium-sniffer -l -i soapy-0 --parsed | python3 iridium-toolkit/reassembler.py -m acars
 
@@ -476,9 +482,7 @@ Add `--acars` for human-readable text output locally while feeding:
 
 In Docker Compose, set `ENABLE_IRDM=true` and `IRDM_CONNECTIONS=udp` on the acarshub container (default port 5558).
 
-**Note:** `--acars-udp` outputs a different JSON format (dumpvdl2/dumphfdl envelope with `"iridium"` as the top-level key). This is a forward-looking format that has not yet been validated against any third-party aggregation sites. Use `--acarshub` for known-working compatibility with existing services. Both flags can be used simultaneously.
-
-In Docker Compose, set `ENABLE_IRDM=true` and `IRDM_CONNECTIONS=udp` on the acarshub container (default port 5558).
+**Note:** `--acars-udp` outputs a different JSON format (dumpvdl2/dumphfdl envelope with `"iridium"` as the top-level key). This is a forward-looking format that has not yet been validated against any third-party aggregation sites. Use `--acarshub` for known-working compatibility with existing services. Both flags can be used simultaneously. The `--acarshub` flag exists as a compatibility shim -- once aggregator sites adopt the richer dumpvdl2 envelope format from `--acars-udp`, it can be retired.
 
 ## Parsed IDA Output
 
