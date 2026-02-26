@@ -152,8 +152,11 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 # ACARS JSON to stdout (dumpvdl2/dumphfdl compatible format)
 ./iridium-sniffer -l -i soapy-0 --acars-json --station=MYSTATION
 
-# Feed airframes.io / acarshub (iridium-toolkit compat format)
-./iridium-sniffer -l -i soapy-0 --acarshub=feed.airframes.io:5555 --station=MYSTATION
+# Feed airframes.io directly (iridium-toolkit JSON format over TCP)
+./iridium-sniffer -l -i soapy-0 --feed --station=MYSTATION
+
+# Feed acarshub via UDP (iridium-toolkit JSON format)
+./iridium-sniffer -l -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
 
 # Stream JSON via UDP (dumpvdl2 format, for future aggregator support)
 ./iridium-sniffer -l -i soapy-0 --acars-udp=192.168.1.100:5555 --station=MYSTATION
@@ -314,7 +317,7 @@ These flags control ACARS/SBD output, and can be combined:
 | `--acars` | Human-readable text to stdout |
 | `--acars-json` | JSON to stdout (dumpvdl2/dumphfdl format) |
 | `--acars-udp=HOST:PORT` | JSON via UDP (dumpvdl2/dumphfdl format, repeatable, max 4) |
-| `--acarshub=HOST:PORT` | JSON via UDP (iridium-toolkit format, for [acarshub](https://github.com/sdr-enthusiasts/docker-acarshub)) |
+| `--feed[=PROTO://HOST:PORT]` | Feed aggregator (iridium-toolkit JSON format, UDP or TCP) |
 
 This replaces the `reassembler.py -m acars` pipeline entirely -- no Python needed. When [libacars-2](https://github.com/szpajder/libacars) is installed, ARINC-622 application payloads (ADS-C, CPDLC, OHMA, MIAM) are fully decoded. Without libacars, basic ACARS field extraction still works.
 
@@ -328,8 +331,11 @@ This replaces the `reassembler.py -m acars` pipeline entirely -- no Python neede
 # Stream JSON over UDP to a remote aggregator
 ./iridium-sniffer -l -i usrp-B210-SERIAL --acars-udp=192.168.1.100:5555 --station=MYSTATION
 
-# Stream to acarshub (iridium-toolkit compatible format)
-./iridium-sniffer -l -i usrp-B210-SERIAL --acarshub=127.0.0.1:5558 --station=MYSTATION
+# Feed acarshub via UDP (iridium-toolkit JSON format)
+./iridium-sniffer -l -i usrp-B210-SERIAL --feed=udp://127.0.0.1:5558 --station=MYSTATION
+
+# Feed airframes.io directly via TCP (iridium-toolkit JSON format)
+./iridium-sniffer -l -i usrp-B210-SERIAL --feed --station=MYSTATION
 
 # Text on stdout + UDP JSON stream simultaneously
 ./iridium-sniffer -l -i usrp-B210-SERIAL --acars --acars-udp=192.168.1.100:5555 --station=MYSTATION
@@ -455,34 +461,49 @@ or:
 -- libacars: not found (basic ACARS only)
 ```
 
-### Feeding airframes.io, acarshub, and other aggregators
+### Feeding acarshub and airframes.io
 
 The traditional Python pipeline for getting Iridium ACARS into aggregators requires four processes chained together:
 
 ```bash
 # Traditional pipeline (gr-iridium + iridium-toolkit + acars.py)
-iridium-extractor -D 4 rtl-sdr | iridium-parser.py | reassembler.py -m acars -a json | acars.py -s MYSTATION -u udp://feed.airframes.io:5555
+iridium-extractor -D 4 rtl-sdr | iridium-parser.py | reassembler.py -m acars -a json | acars.py -s MYSTATION
 ```
 
-iridium-sniffer replaces that entire chain. Use `--acarshub` for sites that expect the iridium-toolkit JSON format (this includes airframes.io and [acarshub](https://github.com/sdr-enthusiasts/docker-acarshub)):
+iridium-sniffer replaces that entire chain with a single `--feed` flag. The feed output uses the iridium-toolkit JSON format (the same format produced by iridium-toolkit's `reassembler.py -m acars -a json`), so existing aggregators accept it without changes.
+
+**Feed directly to airframes.io** (TCP, port 5590):
 
 ```bash
-# Feed airframes.io (iridium-toolkit format, confirmed compatible)
-./iridium-sniffer -l -i soapy-0 --acarshub=feed.airframes.io:5555 --station=MYSTATION
+# Bare --feed defaults to tcp://feed.airframes.io:5590
+./iridium-sniffer -l -i soapy-0 --feed --station=MYSTATION
+```
 
-# Feed a local acarshub instance (default IRDM port 5558)
-./iridium-sniffer -l -i soapy-0 --acarshub=127.0.0.1:5558 --station=MYSTATION
+**Feed a local acarshub instance** (UDP, port 5558):
+
+```bash
+./iridium-sniffer -l -i soapy-0 --feed=udp://127.0.0.1:5558 --station=MYSTATION
+```
+
+**Feed acarshub via TCP** (also supported):
+
+```bash
+./iridium-sniffer -l -i soapy-0 --feed=tcp://127.0.0.1:15590 --station=MYSTATION
 ```
 
 Add `--acars` for human-readable text output locally while feeding:
 
 ```bash
-./iridium-sniffer -l -i soapy-0 --acars --acarshub=feed.airframes.io:5555 --station=MYSTATION
+./iridium-sniffer -l -i soapy-0 --acars --feed --station=MYSTATION
 ```
 
-In Docker Compose, set `ENABLE_IRDM=true` and `IRDM_CONNECTIONS=udp` on the acarshub container (default port 5558).
+**Docker Compose (acarshub):** Set `ENABLE_IRDM=true` and configure the transport. For UDP: `IRDM_CONNECTIONS=udp` (default port 5558). For TCP: `IRDM_CONNECTIONS=tcp://HOST:PORT`. See the [docker-acarshub](https://github.com/sdr-enthusiasts/docker-acarshub) documentation for details.
 
-**Note:** `--acars-udp` outputs a different JSON format (dumpvdl2/dumphfdl envelope with `"iridium"` as the top-level key). This is a forward-looking format that has not yet been validated against any third-party aggregation sites. Use `--acarshub` for known-working compatibility with existing services. Both flags can be used simultaneously. The `--acarshub` flag exists as a compatibility shim -- once aggregator sites adopt the richer dumpvdl2 envelope format from `--acars-udp`, it can be retired.
+**Two JSON formats:** iridium-sniffer produces two distinct ACARS JSON formats for different purposes:
+
+- `--feed` currently outputs the **iridium-toolkit format** (`"app": {"name": "iridium-toolkit"}` at the top level). This is the established format that acarshub and airframes.io already accept. Use this for feeding aggregators today.
+
+- `--acars-json` / `--acars-udp` output a **dumpvdl2/dumphfdl envelope format** (`"iridium"` as the top-level key, matching the structure of dumpvdl2's `"vdl2"` and dumphfdl's `"hfdl"`). This is a richer, more structured format with full libacars ARINC-622 decoding. Once aggregator sites accept the dumpvdl2 envelope, `--feed` will adopt it and `--acars-udp` can be retired -- `--feed` remains the single flag for feeding aggregators regardless of which wire format it carries.
 
 ## Parsed IDA Output
 
@@ -640,9 +661,11 @@ GSMTAP:
 
 ACARS:
     --acars                 decode and display ACARS/SBD messages from IDA
-    --acars-json            output ACARS as JSON to stdout
-    --acars-udp=HOST:PORT   stream ACARS JSON via UDP (repeatable, max 4)
-    --acarshub=HOST:PORT    stream to acarshub (iridium-toolkit format)
+    --acars-json            output ACARS as JSON to stdout (dumpvdl2 format)
+    --acars-udp=HOST:PORT   stream ACARS JSON via UDP (dumpvdl2 format, repeatable, max 4)
+    --feed[=PROTO://HOST:PORT]  feed aggregator (iridium-toolkit JSON format)
+                             udp://HOST:PORT for acarshub, tcp://HOST:PORT for airframes.io
+                             bare --feed defaults to tcp://feed.airframes.io:5590
     --station=ID            station identifier for JSON output
 
 Output:

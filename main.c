@@ -148,9 +148,11 @@ char *acars_udp_hosts[ACARS_UDP_MAX];
 int acars_udp_ports[ACARS_UDP_MAX];
 int acars_udp_count = 0;
 
-/* acarshub compatibility endpoint (iridium-toolkit format) */
-char *acarshub_host = NULL;
-int acarshub_port = 0;
+/* Aggregator feed endpoints (iridium-toolkit JSON format) */
+char *feed_udp_host = NULL;
+int feed_udp_port = 0;
+char *feed_tcp_host = NULL;
+int feed_tcp_port = 0;
 
 /* Threading state */
 volatile sig_atomic_t running = 1;
@@ -586,7 +588,8 @@ int main(int argc, char **argv) {
     if (acars_enabled) {
         acars_init(station_id, (const char **)acars_udp_hosts,
                    acars_udp_ports, acars_udp_count,
-                   acarshub_host, acarshub_port);
+                   feed_udp_host, feed_udp_port,
+                   feed_tcp_host, feed_tcp_port);
         fprintf(stderr, "ACARS: enabled (%s output%s",
                 acars_json ? "JSON" : "text",
                 station_id ? ", station set" : "");
@@ -594,8 +597,10 @@ int main(int argc, char **argv) {
             fprintf(stderr, ", UDP stream");
         else if (acars_udp_count > 1)
             fprintf(stderr, ", %d UDP streams", acars_udp_count);
-        if (acarshub_host)
-            fprintf(stderr, ", acarshub");
+        if (feed_udp_host)
+            fprintf(stderr, ", feed udp://%s:%d", feed_udp_host, feed_udp_port);
+        if (feed_tcp_host)
+            fprintf(stderr, ", feed tcp://%s:%d", feed_tcp_host, feed_tcp_port);
         fprintf(stderr, ")\n");
     }
 

@@ -82,8 +82,10 @@ extern char *station_id;
 extern char *acars_udp_hosts[ACARS_UDP_MAX];
 extern int acars_udp_ports[ACARS_UDP_MAX];
 extern int acars_udp_count;
-extern char *acarshub_host;
-extern int acarshub_port;
+extern char *feed_udp_host;
+extern int feed_udp_port;
+extern char *feed_tcp_host;
+extern int feed_tcp_port;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -135,7 +137,10 @@ static void usage(int exitcode) {
 "    --acars               decode and display ACARS messages from IDA\n"
 "    --acars-json          output ACARS as JSON (compatible with acars.py)\n"
 "    --acars-udp=HOST:PORT stream ACARS JSON via UDP (repeatable, max 4)\n"
-"    --acarshub=HOST:PORT  stream to acarshub (iridium-toolkit compat format)\n"
+"    --feed[=PROTO://HOST:PORT] feed aggregator (iridium-toolkit JSON format)\n"
+"                             udp://HOST:PORT for acarshub (e.g. udp://127.0.0.1:5558)\n"
+"                             tcp://HOST:PORT for airframes.io direct\n"
+"                             bare --feed defaults to tcp://feed.airframes.io:5590\n"
 "    --station=ID          station identifier for ACARS JSON output\n"
 "    -v, --verbose           verbose output to stderr\n"
 "    -h, --help              show this help\n"
@@ -191,7 +196,7 @@ void parse_options(int argc, char **argv) {
         OPT_ACARS,
         OPT_ACARS_JSON,
         OPT_ACARS_UDP,
-        OPT_ACARSHUB,
+        OPT_FEED,
         OPT_STATION,
     };
 
@@ -227,7 +232,7 @@ void parse_options(int argc, char **argv) {
         { "acars",          no_argument,       NULL, OPT_ACARS },
         { "acars-json",     no_argument,       NULL, OPT_ACARS_JSON },
         { "acars-udp",      required_argument, NULL, OPT_ACARS_UDP },
-        { "acarshub",       required_argument, NULL, OPT_ACARSHUB },
+        { "feed",           optional_argument, NULL, OPT_FEED },
         { "station",        required_argument, NULL, OPT_STATION },
         { NULL,             0,                 NULL, 0 }
     };
@@ -399,18 +404,40 @@ void parse_options(int argc, char **argv) {
                 }
                 break;
 
-            case OPT_ACARSHUB:
+            case OPT_FEED:
                 acars_enabled = 1;
-                {
-                    char *colon = strrchr(optarg, ':');
+                if (!optarg) {
+                    /* bare --feed defaults to airframes.io TCP */
+                    feed_tcp_host = strdup("feed.airframes.io");
+                    feed_tcp_port = 5590;
+                } else if (strncmp(optarg, "udp://", 6) == 0) {
+                    char *addr = optarg + 6;
+                    char *colon = strrchr(addr, ':');
                     if (!colon)
-                        errx(1, "--acarshub requires HOST:PORT (e.g. 127.0.0.1:5558)");
+                        errx(1, "--feed udp:// requires HOST:PORT "
+                             "(e.g. udp://127.0.0.1:5558)");
                     *colon = '\0';
                     int port = atoi(colon + 1);
                     if (port <= 0 || port > 65535)
-                        errx(1, "Invalid acarshub port: %s", colon + 1);
-                    acarshub_host = strdup(optarg);
-                    acarshub_port = port;
+                        errx(1, "Invalid feed port: %s", colon + 1);
+                    feed_udp_host = strdup(addr);
+                    feed_udp_port = port;
+                } else if (strncmp(optarg, "tcp://", 6) == 0) {
+                    char *addr = optarg + 6;
+                    char *colon = strrchr(addr, ':');
+                    if (!colon)
+                        errx(1, "--feed tcp:// requires HOST:PORT "
+                             "(e.g. tcp://feed.airframes.io:5590)");
+                    *colon = '\0';
+                    int port = atoi(colon + 1);
+                    if (port <= 0 || port > 65535)
+                        errx(1, "Invalid feed port: %s", colon + 1);
+                    feed_tcp_host = strdup(addr);
+                    feed_tcp_port = port;
+                } else {
+                    errx(1, "--feed requires udp:// or tcp:// prefix "
+                         "(e.g. --feed=udp://127.0.0.1:5558 or "
+                         "--feed=tcp://feed.airframes.io:5590)");
                 }
                 break;
 
