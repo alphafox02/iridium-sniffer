@@ -52,8 +52,22 @@ if(NOT HAVE_ANY_SDR)
                     "Install at least one of: libhackrf, libbladeRF, UHD, SoapySDR")
 endif()
 
-# Optional libacars-2 for ARINC-622/ADS-C/CPDLC decoding in ACARS messages
+# Optional ZMQ for multi-consumer PUB/SUB output (iridium-toolkit compatible)
 find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBZMQ QUIET libzmq)
+endif()
+if(NOT LIBZMQ_FOUND)
+    find_library(LIBZMQ_LIB zmq)
+    find_path(LIBZMQ_INC zmq.h)
+    if(LIBZMQ_LIB AND LIBZMQ_INC)
+        set(LIBZMQ_FOUND TRUE)
+        set(LIBZMQ_LIBRARIES ${LIBZMQ_LIB})
+        set(LIBZMQ_INCLUDE_DIRS ${LIBZMQ_INC})
+    endif()
+endif()
+
+# Optional libacars-2 for ARINC-622/ADS-C/CPDLC decoding in ACARS messages
 if(PkgConfig_FOUND)
     pkg_check_modules(LIBACARS QUIET libacars-2)
 endif()
@@ -173,6 +187,16 @@ if(LIBACARS_FOUND)
     message(STATUS "libacars: enabled (ARINC-622/ADS-C/CPDLC decoding)")
 else()
     message(STATUS "libacars: not found (basic ACARS only)")
+endif()
+
+# ZMQ PUB/SUB output
+if(LIBZMQ_FOUND)
+    target_link_libraries(iridium-sniffer PRIVATE ${LIBZMQ_LIBRARIES})
+    target_include_directories(iridium-sniffer PRIVATE ${LIBZMQ_INCLUDE_DIRS})
+    target_compile_definitions(iridium-sniffer PRIVATE HAVE_ZMQ)
+    message(STATUS "ZMQ: enabled (multi-consumer PUB/SUB output)")
+else()
+    message(STATUS "ZMQ: not found (install libzmq3-dev for --zmq support)")
 endif()
 
 # GPU acceleration

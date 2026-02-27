@@ -22,6 +22,7 @@ Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames direct
 - Built-in web map with live satellite and ring alert visualization
 - Doppler-based receiver positioning from decoded satellite signals (`--position`)
 - GPU-accelerated FFT burst detection (OpenCL or Vulkan)
+- ZMQ PUB/SUB output (`--zmq`) for multi-consumer iridium-toolkit compatibility
 - Multi-threaded architecture: detection, downmix pool, demodulation, stats
 - HackRF, BladeRF, USRP, and SoapySDR support
 - Reads ci8, ci16, and cf32 IQ files with auto-detection from file extension
@@ -60,6 +61,9 @@ sudo apt install libsoapysdr-dev    # RTL-SDR, Airspy, LimeSDR, etc. via SoapySD
 # Optional: ACARS ARINC-622/ADS-C/CPDLC decoding
 sudo apt install libacars-dev        # libacars-2
 
+# Optional: ZMQ multi-consumer output (replaces stdout piping)
+sudo apt install libzmq3-dev         # --zmq flag
+
 # Optional: GPU-accelerated burst detection
 sudo apt install ocl-icd-opencl-dev  # OpenCL (NVIDIA, AMD, Intel)
 
@@ -76,6 +80,7 @@ CMake output shows what was detected:
 -- USRP (UHD): enabled
 -- SoapySDR: enabled
 -- libacars: enabled (ARINC-622/ADS-C/CPDLC decoding)
+-- ZMQ: enabled (multi-consumer PUB/SUB output)
 -- GPU acceleration: OpenCL
 ```
 
@@ -145,6 +150,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug
 
 # Pipe to iridium-toolkit
 ./iridium-sniffer -i soapy-0 | python3 iridium-toolkit/iridium-parser.py
+
+# ZMQ multi-consumer output (multiple iridium-toolkit subscribers)
+./iridium-sniffer -i soapy-0 --zmq
 
 # Built-in ACARS/SBD decoding (no Python needed)
 ./iridium-sniffer -i soapy-0 --acars
@@ -630,6 +638,58 @@ Then specify the interface with `-i`. SoapySDR devices can be selected by index 
     python3 iridium-toolkit/reassembler.py
 ```
 
+### ZMQ Multi-Consumer Output
+
+The `--zmq` flag publishes output lines over a ZMQ PUB socket, enabling multiple independent iridium-toolkit consumers to subscribe simultaneously. This replaces the stdout pipe (which only supports a single consumer) with a fan-out architecture matching how gr-iridium's ZMQ output worked.
+
+```bash
+# Publish RAW output on default endpoint (tcp://*:7006)
+./iridium-sniffer -i soapy-0 --zmq
+
+# Custom endpoint
+./iridium-sniffer -i soapy-0 --zmq=tcp://*:9999
+
+# ZMQ + ACARS: RAW lines go to ZMQ, ACARS text goes to stdout
+./iridium-sniffer -i soapy-0 --zmq --acars --station=MYSTATION
+
+# ZMQ + web map
+./iridium-sniffer -i soapy-0 --zmq --web
+```
+
+Subscribers connect using any ZMQ SUB client. With iridium-toolkit:
+
+```bash
+# Terminal 1: iridium-parser.py
+python3 -c "
+import zmq, sys
+ctx = zmq.Context()
+sub = ctx.socket(zmq.SUB)
+sub.connect('tcp://127.0.0.1:7006')
+sub.subscribe(b'')
+while True:
+    print(sub.recv_string())
+    sys.stdout.flush()
+" | python3 iridium-toolkit/iridium-parser.py
+
+# Terminal 2: reassembler for ACARS (subscribed to same ZMQ)
+python3 -c "
+import zmq, sys
+ctx = zmq.Context()
+sub = ctx.socket(zmq.SUB)
+sub.connect('tcp://127.0.0.1:7006')
+sub.subscribe(b'')
+while True:
+    print(sub.recv_string())
+    sys.stdout.flush()
+" | python3 iridium-toolkit/iridium-parser.py | python3 iridium-toolkit/reassembler.py -m acars
+```
+
+When `--zmq` is combined with `--acars`, RAW lines are still published to ZMQ (so iridium-toolkit consumers get full data) while ACARS text output goes to stdout. Without `--acars`, RAW lines go to both stdout and ZMQ.
+
+ZMQ PUB sockets are non-blocking: if no subscribers are connected, messages are silently dropped with no performance impact. Subscribers can connect and disconnect at any time.
+
+Requires libzmq (`sudo apt install libzmq3-dev`). The feature is compiled in only when libzmq is detected at build time.
+
 ## Command Reference
 
 ```
@@ -678,6 +738,9 @@ ACARS:
                              udp://HOST:PORT for acarshub, tcp://HOST:PORT for airframes.io
                              bare --feed defaults to tcp://feed.airframes.io:5590
     --station=ID            station identifier for JSON output
+
+ZMQ:
+    --zmq[=ENDPOINT]        publish output via ZMQ PUB (default: tcp://*:7006)
 
 Output:
     --file-info=STR         file info string for RAW output (default: auto)

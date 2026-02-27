@@ -28,4 +28,10 @@ void frame_output_print(demod_frame_t *frame);
 /* Print one decoded IDA burst in iridium-parser.py parsed format to stdout. */
 void frame_output_print_ida(const ida_burst_t *burst);
 
+/* ZMQ PUB output for multi-consumer iridium-toolkit compatibility */
+#ifdef HAVE_ZMQ
+int frame_output_zmq_init(const char *endpoint);
+void frame_output_zmq_shutdown(void);
+#endif
+
 #endif

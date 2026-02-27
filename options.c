@@ -91,6 +91,8 @@ extern char *feed_udp_host;
 extern int feed_udp_port;
 extern char *feed_tcp_host;
 extern int feed_tcp_port;
+extern int zmq_enabled;
+extern char *zmq_endpoint;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -151,6 +153,10 @@ static void usage(int exitcode) {
 "                             tcp://HOST:PORT for airframes.io direct\n"
 "                             bare --feed defaults to tcp://feed.airframes.io:5590\n"
 "    --station=ID          station identifier for ACARS JSON output\n"
+#ifdef HAVE_ZMQ
+"    --zmq[=ENDPOINT]     publish output via ZMQ PUB socket for multi-consumer\n"
+"                             (default: tcp://*:7006, compatible with iridium-toolkit)\n"
+#endif
 "    -v, --verbose           verbose output to stderr\n"
 "    -h, --help              show this help\n"
 "    --list                  list available SDR interfaces\n"
@@ -208,6 +214,7 @@ void parse_options(int argc, char **argv) {
         OPT_FEED,
         OPT_STATION,
         OPT_SOAPY_SETTING,
+        OPT_ZMQ,
     };
 
     static const struct option longopts[] = {
@@ -245,6 +252,7 @@ void parse_options(int argc, char **argv) {
         { "feed",           optional_argument, NULL, OPT_FEED },
         { "station",        required_argument, NULL, OPT_STATION },
         { "soapy-setting",  required_argument, NULL, OPT_SOAPY_SETTING },
+        { "zmq",            optional_argument, NULL, OPT_ZMQ },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -458,6 +466,16 @@ void parse_options(int argc, char **argv) {
 
             case OPT_STATION:
                 station_id = strdup(optarg);
+                break;
+
+            case OPT_ZMQ:
+#ifdef HAVE_ZMQ
+                zmq_enabled = 1;
+                if (optarg)
+                    zmq_endpoint = strdup(optarg);
+#else
+                errx(1, "--zmq requires ZMQ support (install libzmq3-dev and rebuild)");
+#endif
                 break;
 
             case OPT_SOAPY_SETTING:

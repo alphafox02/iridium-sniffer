@@ -159,6 +159,11 @@ int feed_udp_port = 0;
 char *feed_tcp_host = NULL;
 int feed_tcp_port = 0;
 
+/* ZMQ PUB output for multi-consumer iridium-toolkit compatibility */
+int zmq_enabled = 0;
+char *zmq_endpoint = NULL;
+#define ZMQ_DEFAULT_ENDPOINT "tcp://*:7006"
+
 /* Threading state */
 volatile sig_atomic_t running = 1;
 pid_t self_pid;
@@ -566,6 +571,15 @@ int main(int argc, char **argv) {
     fftw_load_wisdom();
     frame_output_init(file_info);
 
+#ifdef HAVE_ZMQ
+    if (zmq_enabled) {
+        const char *ep = zmq_endpoint ? zmq_endpoint : ZMQ_DEFAULT_ENDPOINT;
+        if (frame_output_zmq_init(ep) != 0)
+            errx(1, "Failed to bind ZMQ PUB socket on %s", ep);
+        fprintf(stderr, "ZMQ: publishing on %s\n", ep);
+    }
+#endif
+
     if (web_enabled || gsmtap_enabled || position_enabled)
         frame_decode_init();
 
@@ -782,6 +796,11 @@ int main(int argc, char **argv) {
         acars_print_stats();
         acars_shutdown();
     }
+
+#ifdef HAVE_ZMQ
+    if (zmq_enabled)
+        frame_output_zmq_shutdown();
+#endif
 
     if (in_file != NULL)
         fclose(in_file);
