@@ -26,7 +26,7 @@ extern int verbose;
 #define MIN_MEASUREMENTS     8       /* minimum to attempt a solution */
 #define MIN_SATELLITES       2       /* need geometry from multiple passes */
 #define MAX_ITERATIONS       200     /* WLS iteration limit */
-#define CONVERGENCE_M        1000.0  /* position correction threshold (m) */
+#define CONVERGENCE_M        100.0   /* position correction threshold (m) */
 #define OUTLIER_SIGMA        3.0     /* residual rejection threshold */
 #define MAX_MEAS_AGE_NS      (30ULL * 60 * 1000000000ULL)  /* 30 min */
 #define MIN_VEL_INTERVAL_NS  (2ULL * 1000000000ULL)         /* 2 sec */
@@ -89,6 +89,13 @@ static void vec3_sub(const double a[3], const double b[3], double out[3])
     out[2] = a[2] - b[2];
 }
 
+static void vec3_cross(const double a[3], const double b[3], double out[3])
+{
+    out[0] = a[1]*b[2] - a[2]*b[1];
+    out[1] = a[2]*b[0] - a[0]*b[2];
+    out[2] = a[0]*b[1] - a[1]*b[0];
+}
+
 /* Assign the nearest Iridium channel frequency to a measured frequency */
 static double assign_channel_freq(double freq)
 {
@@ -149,96 +156,116 @@ static sat_meas_t *sat_buf_get(sat_buffer_t *s, int idx)
 /* Estimate the true channel frequency for a satellite from its measurements.
  * Problem: Iridium Doppler can exceed half the channel width (±20.8 kHz of
  * 41.667 kHz channels), so naive nearest-channel assignment is wrong ~49%
- * of the time. Solution: find the measurement with the smallest offset from
- * its nearest channel center -- this one has the smallest Doppler and is most
- * likely to be on the correct channel. Use that channel for all measurements. */
+ * of the time. Solution: vote across all measurements -- each measurement
+ * maps to its nearest channel center, and the channel with the most votes
+ * wins. Wrong assignments scatter across different channels, but the correct
+ * channel accumulates a majority of votes (measurements near zero Doppler
+ * all agree on the correct channel). */
 static double estimate_channel_freq(sat_buffer_t *s, uint64_t now)
 {
-    double best_freq = 0;
-    double min_offset = 1e18;
+    /* Collect nearest-channel assignments for all valid measurements */
+    double channels[MEAS_PER_SAT];
+    int n_valid = 0;
 
     for (int i = 0; i < s->count; i++) {
         sat_meas_t *m = sat_buf_get(s, i);
         if (!m || !m->valid) continue;
         if (now > 0 && now - m->timestamp > MAX_MEAS_AGE_NS) continue;
+        channels[n_valid++] = assign_channel_freq(m->freq);
+    }
+    if (n_valid == 0) return 0;
 
-        double chan = assign_channel_freq(m->freq);
-        double offset = fabs(m->freq - chan);
-        if (offset < min_offset) {
-            min_offset = offset;
-            best_freq = chan;
+    /* Find the channel with the most votes */
+    double best_freq = 0;
+    int best_count = 0;
+
+    for (int i = 0; i < n_valid; i++) {
+        int count = 0;
+        for (int j = 0; j < n_valid; j++) {
+            if (fabs(channels[j] - channels[i]) < 1.0)
+                count++;
+        }
+        if (count > best_count) {
+            best_count = count;
+            best_freq = channels[i];
         }
     }
     return best_freq;
 }
 
-/* Estimate satellite velocity at measurement index using central differencing.
- * Uses the vis-viva equation for speed magnitude and position differencing
- * for direction. Returns 0 on success, -1 if insufficient data. */
+/* Estimate satellite velocity using orbital mechanics.
+ *
+ * Position differencing gives ~7-15 degree direction error due to 4 km IRA
+ * quantization over short baselines. Instead, determine the orbital plane from
+ * the cross product of two well-separated position vectors (h = r1 x r2), then
+ * compute velocity as h x r / |h x r| (perpendicular to both the orbital pole
+ * and current position -- geometrically exact for a circular orbit).
+ *
+ * Two positions separated by 5 minutes span ~2200 km of arc, so the orbital
+ * plane is determined with sub-degree accuracy despite 4 km quantization.
+ * Speed magnitude comes from the vis-viva equation. */
 static int estimate_velocity(sat_buffer_t *s, int idx, double vel[3])
 {
-    /* Find two surrounding measurements for differencing */
-    sat_meas_t *prev = NULL, *next = NULL;
     sat_meas_t *cur = sat_buf_get(s, idx);
     if (!cur) return -1;
 
-    /* Search backward for a measurement at least MIN_VEL_INTERVAL_NS earlier */
-    for (int i = idx - 1; i >= 0; i--) {
+    double r_norm = vec3_norm(cur->sat_ecef);
+    if (r_norm < 1e6) return -1;
+
+    /* Find the most temporally separated measurement for best orbital plane
+     * accuracy. Prefer larger separation (more arc = less quantization noise).
+     * Cap at 10 minutes to avoid orbital perturbation drift. */
+    sat_meas_t *best_other = NULL;
+    double best_dt = 0;
+
+    for (int i = 0; i < s->count; i++) {
+        if (i == idx) continue;
         sat_meas_t *m = sat_buf_get(s, i);
-        if (m && m->valid && cur->timestamp - m->timestamp >= MIN_VEL_INTERVAL_NS) {
-            prev = m;
-            break;
+        if (!m || !m->valid) continue;
+        double dt = fabs((double)(m->timestamp - cur->timestamp) / 1e9);
+        if (dt >= MIN_VEL_INTERVAL_NS / 1e9 && dt < 600.0 && dt > best_dt) {
+            /* Verify the other position is also at valid orbit altitude */
+            double other_r = vec3_norm(m->sat_ecef);
+            if (other_r < 7050e3 || other_r > 7250e3) continue;
+            best_dt = dt;
+            best_other = m;
         }
     }
+    if (!best_other) return -1;
 
-    /* Search forward for a measurement at least MIN_VEL_INTERVAL_NS later */
-    for (int i = idx + 1; i < s->count; i++) {
-        sat_meas_t *m = sat_buf_get(s, i);
-        if (m && m->valid && m->timestamp - cur->timestamp >= MIN_VEL_INTERVAL_NS) {
-            next = m;
-            break;
-        }
-    }
+    /* Orbital angular momentum vector: h = r_cur x r_other
+     * Defines the orbital plane normal. Direction depends on which
+     * position is "first" but we fix the sign below using temporal order. */
+    double h[3];
+    vec3_cross(cur->sat_ecef, best_other->sat_ecef, h);
+    double h_norm = vec3_norm(h);
+    if (h_norm < 1e6) return -1;  /* nearly collinear positions */
 
-    /* Need at least one neighbor for direction */
-    const double *p1, *p2;
-    double dt;
-    if (prev && next) {
-        p1 = prev->sat_ecef;
-        p2 = next->sat_ecef;
-        dt = (double)(next->timestamp - prev->timestamp) / 1e9;
-    } else if (prev) {
-        p1 = prev->sat_ecef;
-        p2 = cur->sat_ecef;
-        dt = (double)(cur->timestamp - prev->timestamp) / 1e9;
-    } else if (next) {
-        p1 = cur->sat_ecef;
-        p2 = next->sat_ecef;
-        dt = (double)(next->timestamp - cur->timestamp) / 1e9;
-    } else {
-        return -1;
-    }
+    /* Velocity direction: v = h x r / |h x r|
+     * Perpendicular to both orbital pole (h) and position (r),
+     * lying in the orbital plane. This is exact for circular orbits. */
+    double v_dir[3];
+    vec3_cross(h, cur->sat_ecef, v_dir);
+    double v_norm = vec3_norm(v_dir);
+    if (v_norm < 1.0) return -1;
 
-    if (dt < 0.1) return -1;  /* guard against tiny intervals */
+    /* Determine sign from temporal ordering: the satellite should move
+     * in the v_dir direction over time. Use the displacement vector
+     * from the earlier to later position to check. */
+    double forward[3];
+    if (best_other->timestamp > cur->timestamp)
+        vec3_sub(best_other->sat_ecef, cur->sat_ecef, forward);
+    else
+        vec3_sub(cur->sat_ecef, best_other->sat_ecef, forward);
 
-    /* Direction from position differencing */
-    double dir[3];
-    vec3_sub(p2, p1, dir);
-    double dir_norm = vec3_norm(dir);
-    if (dir_norm < 1.0) return -1;  /* positions too close */
+    double sign = (vec3_dot(v_dir, forward) >= 0) ? 1.0 : -1.0;
 
-    dir[0] /= dir_norm;
-    dir[1] /= dir_norm;
-    dir[2] /= dir_norm;
+    /* Speed from vis-viva equation (circular orbit approximation) */
+    double speed = sqrt(GM_EARTH / r_norm);
 
-    /* Speed magnitude from vis-viva equation (circular orbit approximation) */
-    double r = vec3_norm(cur->sat_ecef);
-    if (r < 1e6) return -1;  /* sanity check */
-    double speed = sqrt(GM_EARTH / r);
-
-    vel[0] = speed * dir[0];
-    vel[1] = speed * dir[1];
-    vel[2] = speed * dir[2];
+    vel[0] = sign * speed * v_dir[0] / v_norm;
+    vel[1] = sign * speed * v_dir[1] / v_norm;
+    vel[2] = sign * speed * v_dir[2] / v_norm;
     return 0;
 }
 
@@ -550,9 +577,12 @@ int doppler_pos_solve(doppler_solution_t *out)
 
             /* Compute Doppler and convert to range rate.
              * Use per-satellite channel frequency (not per-measurement) to
-             * avoid wrong channel assignment when Doppler > half channel width. */
+             * avoid wrong channel assignment when Doppler > half channel width.
+             * Use actual channel wavelength (not nominal 1626 MHz) for
+             * accurate range-rate conversion across the Iridium band. */
             double f_doppler = m->freq - sat_chan_freq;
-            double range_rate = -IR_LAMBDA * f_doppler;
+            double chan_lambda = C_LIGHT / sat_chan_freq;
+            double range_rate = -chan_lambda * f_doppler;
 
             solver_meas_t *sm = &all_meas[n_meas];
             memcpy(sm->sat_ecef, m->sat_ecef, sizeof(sm->sat_ecef));
@@ -664,6 +694,12 @@ done_collect:
         double HtWH[4][4] = {{0}};
         double HtWy[4] = {0};
 
+        /* Receiver velocity from Earth rotation: v_rx = omega x r_rx */
+        double rx_vel[3];
+        rx_vel[0] = -OMEGA_EARTH * rx_ecef[1];
+        rx_vel[1] =  OMEGA_EARTH * rx_ecef[0];
+        rx_vel[2] = 0.0;
+
         for (int i = 0; i < n_meas; i++) {
             solver_meas_t *m = &all_meas[i];
 
@@ -673,22 +709,30 @@ done_collect:
             double rho = vec3_norm(los);
             if (rho < 1.0) continue;
 
-            /* Predicted range rate: (r_sat - r_rx) . v_sat / |r_sat - r_rx| */
-            double rho_dot_geom = vec3_dot(los, m->sat_vel) / rho;
+            /* Relative velocity (satellite minus receiver due to Earth rotation) */
+            double rel_vel[3];
+            rel_vel[0] = m->sat_vel[0] - rx_vel[0];
+            rel_vel[1] = m->sat_vel[1] - rx_vel[1];
+            rel_vel[2] = m->sat_vel[2] - rx_vel[2];
+
+            /* Predicted range rate including Earth rotation */
+            double rho_dot_geom = vec3_dot(los, rel_vel) / rho;
             double rho_dot_pred = rho_dot_geom + clock_drift;
 
             /* Residual */
             double dy = m->range_rate - rho_dot_pred;
 
-            /* Partial derivatives of range rate w.r.t. receiver position:
-             * d(rho_dot)/d(x_r) = -vx_s/rho + los_x * rho_dot_geom / rho^2
-             * Uses geometric range rate (without clock drift) since
-             * d(clock_drift)/d(x_r) = 0. */
+            /* Partial derivatives including Earth rotation cross terms.
+             * d(rho_dot)/d(rx_i) = -(v_rel_i)/rho + los_i * rho_dot_geom / rho^2
+             *                      + los . d(-v_rx)/d(rx_i) / rho
+             * where d(v_rx_x)/d(rx_y) = -omega, d(v_rx_y)/d(rx_x) = omega */
             double H_row[4];
             double rho2 = rho * rho;
-            H_row[0] = -m->sat_vel[0] / rho + los[0] * rho_dot_geom / rho2;
-            H_row[1] = -m->sat_vel[1] / rho + los[1] * rho_dot_geom / rho2;
-            H_row[2] = -m->sat_vel[2] / rho + los[2] * rho_dot_geom / rho2;
+            H_row[0] = -rel_vel[0] / rho + los[0] * rho_dot_geom / rho2
+                        + OMEGA_EARTH * los[1] / rho;
+            H_row[1] = -rel_vel[1] / rho + los[1] * rho_dot_geom / rho2
+                        - OMEGA_EARTH * los[0] / rho;
+            H_row[2] = -rel_vel[2] / rho + los[2] * rho_dot_geom / rho2;
             H_row[3] = 1.0;  /* clock drift */
 
             double w = m->weight;
@@ -803,21 +847,36 @@ done_collect:
     /* Outlier rejection: recompute residuals, remove 3-sigma outliers */
     double sum_res2 = 0;
     int n_valid = 0;
-    for (int i = 0; i < n_meas; i++) {
-        solver_meas_t *m = &all_meas[i];
-        double los[3];
-        vec3_sub(m->sat_ecef, rx_ecef, los);
-        double rho = vec3_norm(los);
-        if (rho < 1.0) { m->weight = 0; continue; }
-        double rho_dot_pred = vec3_dot(los, m->sat_vel) / rho + clock_drift;
-        double res = m->range_rate - rho_dot_pred;
-        sum_res2 += res * res;
-        n_valid++;
+    {
+        double orx_vel[3];
+        orx_vel[0] = -OMEGA_EARTH * rx_ecef[1];
+        orx_vel[1] =  OMEGA_EARTH * rx_ecef[0];
+        orx_vel[2] = 0.0;
+
+        for (int i = 0; i < n_meas; i++) {
+            solver_meas_t *m = &all_meas[i];
+            double los[3];
+            vec3_sub(m->sat_ecef, rx_ecef, los);
+            double rho = vec3_norm(los);
+            if (rho < 1.0) { m->weight = 0; continue; }
+            double orel[3] = { m->sat_vel[0] - orx_vel[0],
+                               m->sat_vel[1] - orx_vel[1],
+                               m->sat_vel[2] - orx_vel[2] };
+            double rho_dot_pred = vec3_dot(los, orel) / rho + clock_drift;
+            double res = m->range_rate - rho_dot_pred;
+            sum_res2 += res * res;
+            n_valid++;
+        }
     }
 
     if (n_valid > 4) {
         double sigma = sqrt(sum_res2 / (n_valid - 4));
         rejected = 0;
+        double orx_vel[3];
+        orx_vel[0] = -OMEGA_EARTH * rx_ecef[1];
+        orx_vel[1] =  OMEGA_EARTH * rx_ecef[0];
+        orx_vel[2] = 0.0;
+
         for (int i = 0; i < n_meas; i++) {
             solver_meas_t *m = &all_meas[i];
             if (m->weight == 0) continue;
@@ -825,7 +884,10 @@ done_collect:
             vec3_sub(m->sat_ecef, rx_ecef, los);
             double rho = vec3_norm(los);
             if (rho < 1.0) continue;
-            double rho_dot_pred = vec3_dot(los, m->sat_vel) / rho + clock_drift;
+            double orel[3] = { m->sat_vel[0] - orx_vel[0],
+                               m->sat_vel[1] - orx_vel[1],
+                               m->sat_vel[2] - orx_vel[2] };
+            double rho_dot_pred = vec3_dot(los, orel) / rho + clock_drift;
             double res = fabs(m->range_rate - rho_dot_pred);
             if (res > OUTLIER_SIGMA * sigma) {
                 m->weight = 0;
@@ -833,14 +895,19 @@ done_collect:
             }
         }
 
-        /* Re-solve if outliers were rejected */
+        /* Re-solve if outliers were rejected.
+         * Keep position and clock drift from first solve as starting point. */
         if (rejected > 0 && n_valid - rejected >= MIN_MEASUREMENTS) {
             converged = 0;
-            clock_drift = 0;
 
             for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
                 double HtWH2[4][4] = {{0}};
                 double HtWy2[4] = {0};
+
+                double rx_vel2[3];
+                rx_vel2[0] = -OMEGA_EARTH * rx_ecef[1];
+                rx_vel2[1] =  OMEGA_EARTH * rx_ecef[0];
+                rx_vel2[2] = 0.0;
 
                 for (int i = 0; i < n_meas; i++) {
                     solver_meas_t *m = &all_meas[i];
@@ -851,15 +918,22 @@ done_collect:
                     double rho = vec3_norm(los);
                     if (rho < 1.0) continue;
 
-                    double rho_dot_geom = vec3_dot(los, m->sat_vel) / rho;
+                    double rel_vel2[3];
+                    rel_vel2[0] = m->sat_vel[0] - rx_vel2[0];
+                    rel_vel2[1] = m->sat_vel[1] - rx_vel2[1];
+                    rel_vel2[2] = m->sat_vel[2] - rx_vel2[2];
+
+                    double rho_dot_geom = vec3_dot(los, rel_vel2) / rho;
                     double rho_dot_pred = rho_dot_geom + clock_drift;
                     double dy = m->range_rate - rho_dot_pred;
 
                     double H_row[4];
                     double rho2 = rho * rho;
-                    H_row[0] = -m->sat_vel[0] / rho + los[0] * rho_dot_geom / rho2;
-                    H_row[1] = -m->sat_vel[1] / rho + los[1] * rho_dot_geom / rho2;
-                    H_row[2] = -m->sat_vel[2] / rho + los[2] * rho_dot_geom / rho2;
+                    H_row[0] = -rel_vel2[0] / rho + los[0] * rho_dot_geom / rho2
+                                + OMEGA_EARTH * los[1] / rho;
+                    H_row[1] = -rel_vel2[1] / rho + los[1] * rho_dot_geom / rho2
+                                - OMEGA_EARTH * los[0] / rho;
+                    H_row[2] = -rel_vel2[2] / rho + los[2] * rho_dot_geom / rho2;
                     H_row[3] = 1.0;
 
                     double w = m->weight;
@@ -928,6 +1002,12 @@ done_collect:
     {
         double HtH[4][4] = {{0}};
         int count = 0;
+
+        double hdop_rx_vel[3];
+        hdop_rx_vel[0] = -OMEGA_EARTH * rx_ecef[1];
+        hdop_rx_vel[1] =  OMEGA_EARTH * rx_ecef[0];
+        hdop_rx_vel[2] = 0.0;
+
         /* Rebuild H^T H from valid (non-rejected) measurements */
         for (int i = 0; i < n_total; i++) {
             solver_meas_t *m = &all_meas[i];
@@ -938,12 +1018,17 @@ done_collect:
             double rho = vec3_norm(los);
             if (rho < 1.0) continue;
 
-            double rho_dot_geom = vec3_dot(los, m->sat_vel) / rho;
+            double hrel[3] = { m->sat_vel[0] - hdop_rx_vel[0],
+                               m->sat_vel[1] - hdop_rx_vel[1],
+                               m->sat_vel[2] - hdop_rx_vel[2] };
+            double rho_dot_geom = vec3_dot(los, hrel) / rho;
             double H_row[4];
             double rho2 = rho * rho;
-            H_row[0] = -m->sat_vel[0]/rho + los[0]*rho_dot_geom/rho2;
-            H_row[1] = -m->sat_vel[1]/rho + los[1]*rho_dot_geom/rho2;
-            H_row[2] = -m->sat_vel[2]/rho + los[2]*rho_dot_geom/rho2;
+            H_row[0] = -hrel[0]/rho + los[0]*rho_dot_geom/rho2
+                        + OMEGA_EARTH * los[1] / rho;
+            H_row[1] = -hrel[1]/rho + los[1]*rho_dot_geom/rho2
+                        - OMEGA_EARTH * los[0] / rho;
+            H_row[2] = -hrel[2]/rho + los[2]*rho_dot_geom/rho2;
             H_row[3] = 1.0;
 
             for (int r = 0; r < 4; r++)

@@ -19,6 +19,7 @@
 /* Physical constants */
 #define GM_EARTH    3.986004418e14         /* gravitational parameter (m^3/s^2) */
 #define C_LIGHT     299792458.0            /* speed of light (m/s) */
+#define OMEGA_EARTH 7.2921150e-5           /* Earth rotation rate (rad/s) */
 
 /* Iridium L-band */
 #define IR_CARRIER_FREQ  1626000000.0      /* nominal carrier frequency (Hz) */
