@@ -25,7 +25,7 @@ extern int verbose;
 #define MEAS_PER_SAT         200     /* circular buffer depth per satellite */
 #define MIN_MEASUREMENTS     8       /* minimum to attempt a solution */
 #define MIN_SATELLITES       2       /* need geometry from multiple passes */
-#define MAX_ITERATIONS       50      /* WLS iteration limit */
+#define MAX_ITERATIONS       200     /* WLS iteration limit */
 #define CONVERGENCE_M        1000.0  /* position correction threshold (m) */
 #define OUTLIER_SIGMA        3.0     /* residual rejection threshold */
 #define MAX_MEAS_AGE_NS      (30ULL * 60 * 1000000000ULL)  /* 30 min */
@@ -46,6 +46,7 @@ typedef struct {
     sat_meas_t meas[MEAS_PER_SAT];
     int head;               /* next write index */
     int count;              /* total stored (capped at MEAS_PER_SAT) */
+    double channel_freq;    /* estimated true channel frequency (0 = unknown) */
 } sat_buffer_t;
 
 /* Flattened measurement for the solver */
@@ -61,7 +62,8 @@ typedef struct {
 static pthread_mutex_t pos_lock;
 static sat_buffer_t satellites[MAX_SATELLITES];
 static int n_satellites;
-static double height_aiding_m;  /* 0 = disabled */
+static double height_aiding_m = -1.0;  /* -1 = disabled, >= 0 = altitude in meters */
+static int height_aiding_enabled;
 
 /* Persistent solution state (reused between solve calls) */
 static double prev_ecef[3] = {0, 0, 0};
@@ -142,6 +144,32 @@ static sat_meas_t *sat_buf_get(sat_buffer_t *s, int idx)
     int start = (s->count < MEAS_PER_SAT) ? 0 :
                 (s->head - s->count + MEAS_PER_SAT) % MEAS_PER_SAT;
     return &s->meas[(start + idx) % MEAS_PER_SAT];
+}
+
+/* Estimate the true channel frequency for a satellite from its measurements.
+ * Problem: Iridium Doppler can exceed half the channel width (±20.8 kHz of
+ * 41.667 kHz channels), so naive nearest-channel assignment is wrong ~49%
+ * of the time. Solution: find the measurement with the smallest offset from
+ * its nearest channel center -- this one has the smallest Doppler and is most
+ * likely to be on the correct channel. Use that channel for all measurements. */
+static double estimate_channel_freq(sat_buffer_t *s, uint64_t now)
+{
+    double best_freq = 0;
+    double min_offset = 1e18;
+
+    for (int i = 0; i < s->count; i++) {
+        sat_meas_t *m = sat_buf_get(s, i);
+        if (!m || !m->valid) continue;
+        if (now > 0 && now - m->timestamp > MAX_MEAS_AGE_NS) continue;
+
+        double chan = assign_channel_freq(m->freq);
+        double offset = fabs(m->freq - chan);
+        if (offset < min_offset) {
+            min_offset = offset;
+            best_freq = chan;
+        }
+    }
+    return best_freq;
 }
 
 /* Estimate satellite velocity at measurement index using central differencing.
@@ -268,13 +296,15 @@ void doppler_pos_init(void)
 {
     pthread_mutex_init(&pos_lock, NULL);
     n_satellites = 0;
-    height_aiding_m = 0;
+    height_aiding_m = -1.0;
+    height_aiding_enabled = 0;
     memset(satellites, 0, sizeof(satellites));
 }
 
 void doppler_pos_set_height(double height_m)
 {
     height_aiding_m = height_m;
+    height_aiding_enabled = 1;
 }
 
 void doppler_pos_add_measurement(const ira_data_t *ira, double frequency,
@@ -500,6 +530,12 @@ int doppler_pos_solve(doppler_solution_t *out)
         if (!sat_keep[s]) continue;
         int sat_contributed = 0;
 
+        /* Determine the true channel frequency for this satellite.
+         * Uses the measurement with smallest offset from nearest channel
+         * center (smallest Doppler = most reliable channel assignment). */
+        double sat_chan_freq = estimate_channel_freq(&satellites[s], now);
+        if (sat_chan_freq == 0) continue;
+
         for (int i = 0; i < satellites[s].count; i++) {
             sat_meas_t *m = sat_buf_get(&satellites[s], i);
             if (!m || !m->valid) continue;
@@ -512,9 +548,10 @@ int doppler_pos_solve(doppler_solution_t *out)
             if (estimate_velocity(&satellites[s], i, vel) != 0)
                 continue;
 
-            /* Compute Doppler and convert to range rate */
-            double chan_freq = assign_channel_freq(m->freq);
-            double f_doppler = m->freq - chan_freq;
+            /* Compute Doppler and convert to range rate.
+             * Use per-satellite channel frequency (not per-measurement) to
+             * avoid wrong channel assignment when Doppler > half channel width. */
+            double f_doppler = m->freq - sat_chan_freq;
             double range_rate = -IR_LAMBDA * f_doppler;
 
             solver_meas_t *sm = &all_meas[n_meas];
@@ -601,7 +638,7 @@ done_collect:
          * Must use geodetic conversion (not simple radius scaling) because
          * WGS-84 is an oblate ellipsoid: surface radius varies by ~21 km
          * between equator and poles. */
-        if (height_aiding_m > 0) {
+        if (height_aiding_enabled) {
             double ilat, ilon, ialt;
             ecef_to_geodetic(rx_ecef, &ilat, &ilon, &ialt);
             geodetic_to_ecef(ilat, ilon, height_aiding_m, rx_ecef);
@@ -617,7 +654,7 @@ done_collect:
 
     /* Iterated Weighted Least Squares */
     int converged = 0;
-    int use_height = (height_aiding_m > 0);
+    int use_height = (height_aiding_enabled);
     int rejected = 0;
 
     for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
@@ -691,8 +728,9 @@ done_collect:
         }
 
         /* Levenberg-Marquardt damping: add lambda * I to diagonal
-         * to regularize when geometry is poor */
-        double lambda = (iter < 5) ? 1.0 : 0.1;
+         * to regularize when geometry is poor.
+         * Adaptive: start high and decrease as corrections shrink. */
+        double lambda = (iter < 10) ? 10.0 : (iter < 50) ? 1.0 : 0.01;
         for (int i = 0; i < 4; i++)
             HtWH[i][i] += lambda * HtWH[i][i] + 1e-6;
 
@@ -746,8 +784,19 @@ done_collect:
     }
 
     if (!converged) {
-        fprintf(stderr, "DOPPLER: solver FAIL - did not converge in %d iterations\n",
-                MAX_ITERATIONS);
+        if (verbose) {
+            double flat, flon, falt;
+            ecef_to_geodetic(rx_ecef, &flat, &flon, &falt);
+            fprintf(stderr, "DOPPLER: solver FAIL - %d iters, %d meas, %d sats, "
+                    "final=%.2f,%.2f alt=%.0fkm clk=%.1f\n",
+                    MAX_ITERATIONS, n_meas, sats_used, flat, flon, falt/1000,
+                    clock_drift);
+        }
+        out->n_measurements = n_meas;
+        out->n_satellites = sats_used;
+        /* Reset previous solution -- starting from a bad position may prevent
+         * convergence indefinitely. Let the solver try fresh next time. */
+        has_prev_solution = 0;
         return 0;
     }
 

@@ -596,10 +596,12 @@ int main(int argc, char **argv) {
 
     if (position_enabled) {
         doppler_pos_init();
-        if (position_height > 0)
-            doppler_pos_set_height(position_height);
-        fprintf(stderr, "Doppler positioning: enabled%s\n",
-                position_height > 0 ? " (with height aiding)" : "");
+        /* Height aiding defaults to 0m (sea level) unless user specifies
+         * a value.  Required to prevent solver diverging to extreme altitude
+         * when satellite geometry is poor. */
+        doppler_pos_set_height(position_height);
+        fprintf(stderr, "Doppler positioning: enabled (height aiding: %.0f m)\n",
+                position_height);
     }
 
     if (web_enabled) {
