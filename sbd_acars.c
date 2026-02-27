@@ -277,7 +277,7 @@ static void hub_emit_acars(const char *mode, const char *reg, char ack,
     hub_buf_append(",\"tail\":\"%s\"", esc_reg);
     hub_buf_append(",\"label\":\"%s\"", esc_label);
     hub_buf_append(",\"block_id\":\"%c\"", blk_id);
-    hub_buf_append(",\"ack\":\"%c\"", ack);
+    hub_buf_append(",\"ack\":\"%c\"", (ack == 0x15) ? '!' : ack);
 
     if (flight && flight[0]) {
         char esc_flt[32];
@@ -663,6 +663,7 @@ static void acars_output_json(const uint8_t *data, int len, int ul,
     char label[4] = {0};
     label[0] = (char)data[9];
     label[1] = (char)data[10];
+    if (data[9] == '_' && data[10] == 0x7f) label[1] = 'd';
 
     char blk_id = (char)data[11];
 
@@ -950,6 +951,7 @@ static void acars_parse_fallback(const uint8_t *data, int len, int ul,
 
         char ack_c = (char)stripped[8];
         char label[3] = { (char)stripped[9], (char)stripped[10], '\0' };
+        if (stripped[9] == '_' && stripped[10] == 0x7f) label[1] = 'd';
         char bid = (char)stripped[11];
 
         const uint8_t *rest = stripped + 12;
