@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -34,14 +35,21 @@
 #include <unistd.h>
 
 #include "web_map.h"
+#include "ida_decode.h"
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 /* ---- Configuration ---- */
 
-#define MAX_RA_POINTS   2000
-#define MAX_SATELLITES  100
-#define MAX_SSE_CLIENTS 8
-#define JSON_BUF_SIZE   65536
-#define HTTP_BUF_SIZE   4096
+#define MAX_RA_POINTS    2000
+#define MAX_BEAM_POINTS  2000
+#define MAX_MT_POINTS    500
+#define MAX_SATELLITES   100
+#define MAX_SSE_CLIENTS  8
+#define JSON_BUF_SIZE    131072
+#define HTTP_BUF_SIZE    4096
 
 /* ---- SSE client count ---- */
 static atomic_int sse_client_count = 0;
@@ -58,6 +66,26 @@ typedef struct {
     uint64_t timestamp;
 } ra_point_t;
 
+/* Ground beam center position (alt < 100 from IRA frames) */
+typedef struct {
+    double lat, lon;
+    int alt;
+    int sat_id, beam_id;
+    int n_pages;
+    uint32_t tmsi;
+    double frequency;
+    uint64_t timestamp;
+} beam_point_t;
+
+/* MT phone/terminal position from IDA reassembly */
+typedef struct {
+    double lat, lon;
+    int alt;
+    uint16_t msg_type;
+    uint64_t timestamp;
+    double frequency;
+} mt_point_t;
+
 typedef struct {
     int sat_id;
     int beam_id;
@@ -70,11 +98,19 @@ static struct {
     ra_point_t ra[MAX_RA_POINTS];
     int ra_head;
     int ra_count;
+    beam_point_t beams[MAX_BEAM_POINTS];
+    int beam_head;
+    int beam_count;
+    mt_point_t mt[MAX_MT_POINTS];
+    int mt_head;
+    int mt_count;
     sat_entry_t sats[MAX_SATELLITES];
     int n_sats;
     unsigned long total_ira;
     unsigned long total_ibc;
     unsigned long total_pages;
+    unsigned long total_beams;
+    unsigned long total_mt;
     /* Doppler positioning receiver estimate */
     double rx_lat, rx_lon;
     double rx_hdop;
@@ -89,14 +125,67 @@ static volatile int server_running = 0;
 
 /* ---- State update functions (thread-safe) ---- */
 
+static void add_beam_locked(const ira_data_t *ra, uint64_t timestamp,
+                             double frequency)
+{
+    /* Deduplication: skip if same sat_id already has this lat/lon recently */
+    int search = (state.beam_count < 20) ? state.beam_count : 20;
+    for (int i = 0; i < search; i++) {
+        int idx = (state.beam_head - 1 - i + MAX_BEAM_POINTS) % MAX_BEAM_POINTS;
+        beam_point_t *b = &state.beams[idx];
+        if (b->sat_id == ra->sat_id &&
+            fabs(b->lat - ra->lat) < 0.001 &&
+            fabs(b->lon - ra->lon) < 0.001) {
+            /* Duplicate -- update timestamp and page info */
+            b->timestamp = timestamp;
+            if (ra->n_pages > 0) {
+                b->n_pages = ra->n_pages;
+                b->tmsi = ra->pages[0].tmsi;
+                state.total_pages++;
+            }
+            state.total_beams++;
+            return;
+        }
+    }
+
+    beam_point_t *p = &state.beams[state.beam_head];
+    p->lat = ra->lat;
+    p->lon = ra->lon;
+    p->alt = ra->alt;
+    p->sat_id = ra->sat_id;
+    p->beam_id = ra->beam_id;
+    p->n_pages = ra->n_pages;
+    p->tmsi = (ra->n_pages > 0) ? ra->pages[0].tmsi : 0;
+    p->frequency = frequency;
+    p->timestamp = timestamp;
+
+    state.beam_head = (state.beam_head + 1) % MAX_BEAM_POINTS;
+    if (state.beam_count < MAX_BEAM_POINTS)
+        state.beam_count++;
+    state.total_beams++;
+    if (ra->n_pages > 0)
+        state.total_pages++;
+}
+
 void web_map_add_ra(const ira_data_t *ra, uint64_t timestamp,
                      double frequency)
 {
-    /* Sanity check coordinates and altitude (Iridium orbits ~780 km) */
+    /* Sanity check coordinates */
     if (ra->lat < -90 || ra->lat > 90 || ra->lon < -180 || ra->lon > 180)
         return;
     if (ra->sat_id == 0 && ra->beam_id == 0 && ra->lat == 0 && ra->lon == 0)
         return;
+
+    /* Ground beam position: alt < 100 km (beam center on earth surface) */
+    if (ra->alt >= 0 && ra->alt < 100) {
+        pthread_mutex_lock(&state.lock);
+        state.total_ira++;
+        add_beam_locked(ra, timestamp, frequency);
+        pthread_mutex_unlock(&state.lock);
+        return;
+    }
+
+    /* Satellite orbital position: 700-900 km */
     if (ra->alt < 700 || ra->alt > 900)
         return;
 
@@ -164,6 +253,113 @@ void web_map_set_position(double lat, double lon, double hdop)
     pthread_mutex_unlock(&state.lock);
 }
 
+void web_map_add_mt(double lat, double lon, int alt, uint16_t msg_type,
+                     uint64_t timestamp, double frequency)
+{
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180)
+        return;
+
+    pthread_mutex_lock(&state.lock);
+
+    mt_point_t *p = &state.mt[state.mt_head];
+    p->lat = lat;
+    p->lon = lon;
+    p->alt = alt;
+    p->msg_type = msg_type;
+    p->timestamp = timestamp;
+    p->frequency = frequency;
+
+    state.mt_head = (state.mt_head + 1) % MAX_MT_POINTS;
+    if (state.mt_count < MAX_MT_POINTS)
+        state.mt_count++;
+    state.total_mt++;
+
+    pthread_mutex_unlock(&state.lock);
+}
+
+/* ---- MT position extraction from IDA messages ---- */
+
+/* Extract 12-bit signed XYZ from 5 bytes (two's complement encoding).
+ * Matches iridium-toolkit util.py xyz() function. */
+static int mtpos_xyz(const uint8_t *bytes, int skip,
+                      double *lat, double *lon, int *alt)
+{
+    uint64_t val = 0;
+    for (int i = 0; i < 5; i++)
+        val = (val << 8) | bytes[i];
+
+    int sb = 4 - skip;
+
+    int x = (int)((val >> (24 + sb)) & 0xFFF);
+    int y = (int)((val >> (12 + sb)) & 0xFFF);
+    int z = (int)((val >> (0  + sb)) & 0xFFF);
+
+    /* Two's complement sign extension */
+    if (x > 0x7FF) x -= 0x1000;
+    if (y > 0x7FF) y -= 0x1000;
+    if (z > 0x7FF) z -= 0x1000;
+
+    if (x == 0 && y == 0 && z == 0) return 0;
+
+    double xy = sqrt((double)x * x + (double)y * y);
+    *lat = atan2((double)z, xy) * 180.0 / M_PI;
+    *lon = atan2((double)y, (double)x) * 180.0 / M_PI;
+
+    /* radius is Earth-center distance in km (each unit ~4km) */
+    double radius_km = sqrt((double)x * x + (double)y * y +
+                            (double)z * z) * 4.0;
+    *alt = (int)(radius_km - 6371.0);
+
+    if (*lat < -90 || *lat > 90) return 0;
+    /* reject positions with unreasonable Earth-center distance */
+    if (radius_km < 5000.0 || radius_km > 7000.0) return 0;
+    return 1;
+}
+
+void mtpos_ida_cb(const uint8_t *data, int len,
+                   uint64_t timestamp, double frequency,
+                   ir_direction_t direction, float magnitude,
+                   void *user)
+{
+    (void)magnitude;
+    (void)user;
+
+    if (len < 5) return;
+
+    uint16_t msg_type = ((uint16_t)data[0] << 8) | data[1];
+    double lat, lon;
+    int alt;
+    int valid = 0;
+
+    switch (msg_type) {
+    case 0x0605:
+        /* GSM paging with position at offset 36, marker 0x1b */
+        if (len >= 42 && data[36] == 0x1b)
+            valid = mtpos_xyz(data + 37, 0, &lat, &lon, &alt);
+        break;
+
+    case 0x7605:
+        /* SBD paging with position */
+        if (len >= 8 && data[2] == 0x00 && (data[3] & 0xf0) == 0x40)
+            valid = mtpos_xyz(data + 3, 4, &lat, &lon, &alt);
+        break;
+
+    case 0x0600:
+        /* Uplink with position */
+        if (direction == DIR_UPLINK && len >= 24 &&
+            (data[2] == 0x10 || data[2] == 0x40 || data[2] == 0x70) &&
+            data[18] == 0x01)
+            valid = mtpos_xyz(data + 19, 0, &lat, &lon, &alt);
+        break;
+
+    default:
+        return;
+    }
+
+    if (valid)
+        web_map_add_mt(lat, lon, alt, msg_type, timestamp, frequency);
+}
+
 /* ---- JSON serialization ---- */
 
 static int build_json(char *buf, int bufsize)
@@ -172,14 +368,15 @@ static int build_json(char *buf, int bufsize)
 
     int off = 0;
     off += snprintf(buf + off, bufsize - off,
-                    "{\"total_ira\":%lu,\"total_ibc\":%lu,\"total_pages\":%lu,",
-                    state.total_ira, state.total_ibc, state.total_pages);
+                    "{\"total_ira\":%lu,\"total_ibc\":%lu,\"total_pages\":%lu,"
+                    "\"total_beams\":%lu,\"total_mt\":%lu,",
+                    state.total_ira, state.total_ibc, state.total_pages,
+                    state.total_beams, state.total_mt);
 
-    /* Ring alert points (most recent first, max 500 for browser) */
+    /* Satellite orbital positions (most recent first, max 500) */
     off += snprintf(buf + off, bufsize - off, "\"ra\":[");
     int n_out = 0;
-    int max_out = 500;
-    for (int i = 0; i < state.ra_count && n_out < max_out; i++) {
+    for (int i = 0; i < state.ra_count && n_out < 500; i++) {
         int idx = (state.ra_head - 1 - i + MAX_RA_POINTS) % MAX_RA_POINTS;
         ra_point_t *p = &state.ra[idx];
         if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
@@ -192,7 +389,45 @@ static int build_json(char *buf, int bufsize)
             p->tmsi, p->frequency,
             (unsigned long long)(p->timestamp / 1000000000ULL));
         n_out++;
-        if (off >= bufsize - 256) break;
+        if (off >= bufsize - 512) break;
+    }
+    off += snprintf(buf + off, bufsize - off, "],");
+
+    /* Ground beam positions (most recent first, max 300) */
+    off += snprintf(buf + off, bufsize - off, "\"beams\":[");
+    n_out = 0;
+    for (int i = 0; i < state.beam_count && n_out < 300; i++) {
+        int idx = (state.beam_head - 1 - i + MAX_BEAM_POINTS) % MAX_BEAM_POINTS;
+        beam_point_t *p = &state.beams[idx];
+        if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
+        off += snprintf(buf + off, bufsize - off,
+            "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
+            "\"sat\":%d,\"beam\":%d,\"pages\":%d,"
+            "\"tmsi\":%u,\"freq\":%.0f,\"t\":%llu}",
+            p->lat, p->lon, p->alt,
+            p->sat_id, p->beam_id, p->n_pages,
+            p->tmsi, p->frequency,
+            (unsigned long long)(p->timestamp / 1000000000ULL));
+        n_out++;
+        if (off >= bufsize - 512) break;
+    }
+    off += snprintf(buf + off, bufsize - off, "],");
+
+    /* MT phone/terminal positions (most recent first, max 200) */
+    off += snprintf(buf + off, bufsize - off, "\"mt\":[");
+    n_out = 0;
+    for (int i = 0; i < state.mt_count && n_out < 200; i++) {
+        int idx = (state.mt_head - 1 - i + MAX_MT_POINTS) % MAX_MT_POINTS;
+        mt_point_t *p = &state.mt[idx];
+        if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
+        off += snprintf(buf + off, bufsize - off,
+            "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
+            "\"type\":%u,\"freq\":%.0f,\"t\":%llu}",
+            p->lat, p->lon, p->alt,
+            (unsigned)p->msg_type, p->frequency,
+            (unsigned long long)(p->timestamp / 1000000000ULL));
+        n_out++;
+        if (off >= bufsize - 512) break;
     }
     off += snprintf(buf + off, bufsize - off, "],");
 
@@ -257,6 +492,7 @@ static const char HTML_PAGE[] =
 ".popup-title{font-weight:700;font-size:13px;margin-bottom:4px;\n"
 "  padding-bottom:4px;border-bottom:1px solid #e2e8f0}\n"
 ".popup-page{color:#dc2626;font-weight:600}\n"
+".popup-mt{color:#f59e0b;font-weight:600}\n"
 ".legend{position:absolute;bottom:28px;right:10px;z-index:1000;\n"
 "  background:rgba(15,23,42,0.92);color:#e2e8f0;padding:10px 14px;\n"
 "  border-radius:6px;font-size:12px;line-height:2;\n"
@@ -266,13 +502,17 @@ static const char HTML_PAGE[] =
 ".legend-row{display:flex;align-items:center;gap:8px}\n"
 ".legend-swatch{display:inline-block}\n"
 ".leaflet-container{background:#0f172a}\n"
+".leaflet-control-layers{background:rgba(15,23,42,0.92)!important;\n"
+"  color:#e2e8f0!important;border:1px solid #334155!important}\n"
+".leaflet-control-layers label{color:#e2e8f0}\n"
 "</style></head><body>\n"
 "<div id=\"bar\">\n"
 "  <span class=\"title\">iridium-sniffer</span>\n"
-"  <span class=\"stat\">IRA <span id=\"n-ira\" class=\"val\">0</span></span>\n"
-"  <span class=\"stat\">IBC <span id=\"n-ibc\" class=\"val\">0</span></span>\n"
-"  <span class=\"stat\">Satellites <span id=\"n-sats\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">Beams <span id=\"n-beams\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">MT <span id=\"n-mt\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">Pages <span id=\"n-pages\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">Sats <span id=\"n-sats\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\">IRA <span id=\"n-ira\" class=\"val\">0</span></span>\n"
 "  <span id=\"status\" style=\"color:#64748b\">connecting...</span>\n"
 "</div>\n"
 "<div id=\"map\"></div>\n"
@@ -282,7 +522,12 @@ static const char HTML_PAGE[] =
 "    <span class=\"legend-swatch\" style=\"width:16px;height:16px;\n"
 "      border-radius:50%;border:1px solid #3b82f6;\n"
 "      background:rgba(59,130,246,0.12)\"></span>\n"
-"    Beam coverage\n"
+"    Beam footprint\n"
+"  </div>\n"
+"  <div class=\"legend-row\">\n"
+"    <span class=\"legend-swatch\" style=\"width:10px;height:10px;\n"
+"      border-radius:50%;background:#f59e0b\"></span>\n"
+"    MT position\n"
 "  </div>\n"
 "  <div class=\"legend-row\">\n"
 "    <span class=\"legend-swatch\" style=\"width:10px;height:10px;\n"
@@ -306,10 +551,18 @@ static const char HTML_PAGE[] =
 "  '#2dd4bf','#c084fc','#38bdf8','#fb7185','#a3e635'];\n"
 "function sc(id){return C[id%C.length]}\n"
 "\n"
-"var coverLy=L.layerGroup().addTo(map);\n"
-"var satLy=L.layerGroup().addTo(map);\n"
+"var beamLy=L.layerGroup().addTo(map);\n"
+"var mtLy=L.layerGroup().addTo(map);\n"
 "var pageLy=L.layerGroup().addTo(map);\n"
 "var rxLy=L.layerGroup().addTo(map);\n"
+"var satLy=L.layerGroup();\n"
+"var coverLy=L.layerGroup();\n"
+"L.control.layers(null,{\n"
+"  'Beam footprints':beamLy,'MT positions':mtLy,\n"
+"  'Paging events':pageLy,'Receiver':rxLy,\n"
+"  'Satellite tracks':satLy,'Sat coverage':coverLy\n"
+"},{collapsed:false}).addTo(map);\n"
+"\n"
 "var centered=false;\n"
 "var TW=300;\n"
 "var popupOpen=false;\n"
@@ -318,70 +571,130 @@ static const char HTML_PAGE[] =
 "\n"
 "function update(d){\n"
 "  document.getElementById('n-ira').textContent=d.total_ira;\n"
-"  document.getElementById('n-ibc').textContent=d.total_ibc;\n"
+"  document.getElementById('n-beams').textContent=d.total_beams||0;\n"
+"  document.getElementById('n-mt').textContent=d.total_mt||0;\n"
 "  document.getElementById('n-pages').textContent=d.total_pages;\n"
 "  document.getElementById('status').style.color='#22c55e';\n"
 "  document.getElementById('status').textContent='live';\n"
 "\n"
 "  if(popupOpen)return;\n"
 "\n"
-"  coverLy.clearLayers();\n"
-"  satLy.clearLayers();\n"
+"  beamLy.clearLayers();\n"
+"  mtLy.clearLayers();\n"
 "  pageLy.clearLayers();\n"
+"  satLy.clearLayers();\n"
+"  coverLy.clearLayers();\n"
 "\n"
-"  var bySat={},pages=[],now=0;\n"
-"  d.ra.forEach(function(p){\n"
-"    if(p.t>now)now=p.t;\n"
-"    if(!bySat[p.sat])bySat[p.sat]=[];\n"
-"    bySat[p.sat].push(p);\n"
-"    if(p.pages>0)pages.push(p);\n"
-"  });\n"
+"  var now=0;\n"
+"  if(d.beams)d.beams.forEach(function(p){if(p.t>now)now=p.t});\n"
+"  if(d.ra)d.ra.forEach(function(p){if(p.t>now)now=p.t});\n"
+"  if(d.mt)d.mt.forEach(function(p){if(p.t>now)now=p.t});\n"
+"  var cut=now-TW;\n"
 "\n"
-"  var cut=now-TW,nSat=0;\n"
-"  Object.keys(bySat).forEach(function(sid){\n"
-"    var pts=bySat[sid]\n"
-"      .filter(function(p){return p.t>=cut})\n"
-"      .sort(function(a,b){return a.t-b.t});\n"
-"    if(!pts.length)return;\n"
-"    nSat++;\n"
-"    var col=sc(parseInt(sid));\n"
-"    var last=pts[pts.length-1];\n"
-"\n"
-"    pts.forEach(function(pt){\n"
-"      var age=(now-pt.t)/TW;\n"
-"      L.circle([pt.lat,pt.lon],{radius:400000,\n"
-"        stroke:false,fillColor:col,fillOpacity:0.12*(1-age)\n"
-"      }).addTo(coverLy);\n"
+"  /* --- Ground beam footprints (primary) --- */\n"
+"  var nBeamSat=0;\n"
+"  if(d.beams&&d.beams.length>0){\n"
+"    var bySat={};\n"
+"    d.beams.forEach(function(p){\n"
+"      if(p.t<cut)return;\n"
+"      if(!bySat[p.sat])bySat[p.sat]=[];\n"
+"      bySat[p.sat].push(p);\n"
+"      if(p.pages>0){\n"
+"        var pm=L.circleMarker([p.lat,p.lon],{\n"
+"          radius:7,color:'#ef4444',fillColor:'#ef4444',\n"
+"          fillOpacity:0.8,weight:2\n"
+"        });\n"
+"        pm.bindPopup('<div class=\"popup-title popup-page\">Paging</div>'\n"
+"          +'Satellite: '+p.sat+'<br>'\n"
+"          +'Beam: '+p.beam+'<br>'\n"
+"          +'TMSI: 0x'+(p.tmsi>>>0).toString(16).toUpperCase()+'<br>'\n"
+"          +'Position: '+p.lat.toFixed(4)+', '+p.lon.toFixed(4));\n"
+"        pm.addTo(pageLy);\n"
+"      }\n"
 "    });\n"
-"\n"
-"    var m=L.circleMarker([last.lat,last.lon],{\n"
-"      radius:5,color:col,fillColor:col,fillOpacity:0.9,weight:2\n"
+"    Object.keys(bySat).forEach(function(sid){\n"
+"      var pts=bySat[sid].sort(function(a,b){return a.t-b.t});\n"
+"      if(!pts.length)return;\n"
+"      nBeamSat++;\n"
+"      var col=sc(parseInt(sid));\n"
+"      pts.forEach(function(pt){\n"
+"        var age=(now-pt.t)/TW;\n"
+"        L.circle([pt.lat,pt.lon],{radius:200000,\n"
+"          stroke:true,color:col,weight:1,\n"
+"          fillColor:col,fillOpacity:0.10*(1-age)\n"
+"        }).addTo(beamLy);\n"
+"      });\n"
+"      var last=pts[pts.length-1];\n"
+"      var m=L.circleMarker([last.lat,last.lon],{\n"
+"        radius:5,color:col,fillColor:col,fillOpacity:0.9,weight:2\n"
+"      });\n"
+"      m.bindTooltip('Sat '+sid+' B'+last.beam,\n"
+"        {direction:'top',offset:[0,-8]});\n"
+"      m.bindPopup('<div class=\"popup-title\">Beam Center</div>'\n"
+"        +'Satellite: '+sid+'<br>'\n"
+"        +'Beam: '+last.beam+'<br>'\n"
+"        +'Position: '+last.lat.toFixed(4)+', '+last.lon.toFixed(4)+'<br>'\n"
+"        +'Frequency: '+last.freq.toFixed(0)+' Hz');\n"
+"      m.addTo(beamLy);\n"
 "    });\n"
-"    m.bindTooltip('Sat '+sid,{direction:'top',offset:[0,-8]});\n"
-"    m.bindPopup('<div class=\"popup-title\">Satellite '+sid+'</div>'\n"
-"      +'Beam: '+last.beam+'<br>'\n"
-"      +'Position: '+last.lat.toFixed(2)+', '+last.lon.toFixed(2)+'<br>'\n"
-"      +'Altitude: '+last.alt+' km<br>'\n"
-"      +'Frequency: '+last.freq.toFixed(0)+' Hz<br>'\n"
-"      +'Beams: '+pts.length);\n"
-"    m.addTo(satLy);\n"
-"  });\n"
+"  }\n"
+"  document.getElementById('n-sats').textContent=nBeamSat;\n"
 "\n"
-"  document.getElementById('n-sats').textContent=nSat;\n"
-"\n"
-"  pages.forEach(function(p){\n"
-"    if(p.t<cut)return;\n"
-"    var pm=L.circleMarker([p.lat,p.lon],{\n"
-"      radius:6,color:'#ef4444',fillColor:'#ef4444',\n"
-"      fillOpacity:0.7,weight:1\n"
+"  /* --- MT phone/terminal positions --- */\n"
+"  if(d.mt&&d.mt.length>0){\n"
+"    d.mt.forEach(function(p){\n"
+"      if(p.t<cut)return;\n"
+"      var age=(now-p.t)/TW;\n"
+"      var ts=p.type==0x0605?'GSM Page':\n"
+"             p.type==0x7605?'SBD Page':\n"
+"             p.type==0x0600?'Uplink':'Unknown';\n"
+"      var pm=L.circleMarker([p.lat,p.lon],{\n"
+"        radius:5,color:'#f59e0b',fillColor:'#f59e0b',\n"
+"        fillOpacity:0.8*(1-age*0.5),weight:2\n"
+"      });\n"
+"      pm.bindPopup('<div class=\"popup-title popup-mt\">MT Position</div>'\n"
+"        +'Type: '+ts+'<br>'\n"
+"        +'Position: '+p.lat.toFixed(4)+', '+p.lon.toFixed(4)+'<br>'\n"
+"        +'Frequency: '+p.freq.toFixed(0)+' Hz');\n"
+"      pm.addTo(mtLy);\n"
 "    });\n"
-"    pm.bindPopup('<div class=\"popup-title popup-page\">Paging</div>'\n"
-"      +'Satellite: '+p.sat+'<br>'\n"
-"      +'TMSI: 0x'+(p.tmsi>>>0).toString(16).toUpperCase()+'<br>'\n"
-"      +'Position: '+p.lat.toFixed(2)+', '+p.lon.toFixed(2));\n"
-"    pm.addTo(pageLy);\n"
-"  });\n"
+"  }\n"
 "\n"
+"  /* --- Satellite orbital tracks (toggleable, off by default) --- */\n"
+"  if(d.ra&&d.ra.length>0){\n"
+"    var satBySat={};\n"
+"    d.ra.forEach(function(p){\n"
+"      if(p.t<cut)return;\n"
+"      if(!satBySat[p.sat])satBySat[p.sat]=[];\n"
+"      satBySat[p.sat].push(p);\n"
+"    });\n"
+"    Object.keys(satBySat).forEach(function(sid){\n"
+"      var pts=satBySat[sid].sort(function(a,b){return a.t-b.t});\n"
+"      if(!pts.length)return;\n"
+"      var col=sc(parseInt(sid));\n"
+"      pts.forEach(function(pt){\n"
+"        var age=(now-pt.t)/TW;\n"
+"        L.circle([pt.lat,pt.lon],{radius:400000,\n"
+"          stroke:false,fillColor:col,fillOpacity:0.08*(1-age)\n"
+"        }).addTo(coverLy);\n"
+"      });\n"
+"      var last=pts[pts.length-1];\n"
+"      var m=L.circleMarker([last.lat,last.lon],{\n"
+"        radius:4,color:'#64748b',fillColor:'#64748b',\n"
+"        fillOpacity:0.7,weight:1\n"
+"      });\n"
+"      m.bindTooltip('Sat '+sid+' (orbit)',\n"
+"        {direction:'top',offset:[0,-8]});\n"
+"      m.bindPopup('<div class=\"popup-title\">Satellite '+sid+'</div>'\n"
+"        +'Beam: '+last.beam+'<br>'\n"
+"        +'Position: '+last.lat.toFixed(2)+', '+last.lon.toFixed(2)+'<br>'\n"
+"        +'Altitude: '+last.alt+' km<br>'\n"
+"        +'Frequency: '+last.freq.toFixed(0)+' Hz');\n"
+"      m.addTo(satLy);\n"
+"    });\n"
+"  }\n"
+"\n"
+"  /* --- Receiver position --- */\n"
 "  rxLy.clearLayers();\n"
 "  if(d.rx){\n"
 "    var rm=L.circleMarker([d.rx.lat,d.rx.lon],{\n"
@@ -399,12 +712,18 @@ static const char HTML_PAGE[] =
 "    }\n"
 "  }\n"
 "\n"
-"  if(!centered && d.rx){\n"
-"    map.setView([d.rx.lat,d.rx.lon],6);\n"
-"    centered=true;\n"
-"  }else if(!centered && d.ra.length>0){\n"
-"    map.setView([d.ra[0].lat,d.ra[0].lon],3);\n"
-"    centered=true;\n"
+"  /* --- Auto-center --- */\n"
+"  if(!centered){\n"
+"    if(d.rx){\n"
+"      map.setView([d.rx.lat,d.rx.lon],8);\n"
+"      centered=true;\n"
+"    }else if(d.beams&&d.beams.length>0){\n"
+"      map.setView([d.beams[0].lat,d.beams[0].lon],8);\n"
+"      centered=true;\n"
+"    }else if(d.ra&&d.ra.length>0){\n"
+"      map.setView([d.ra[0].lat,d.ra[0].lon],3);\n"
+"      centered=true;\n"
+"    }\n"
 "  }\n"
 "}\n"
 "\n"

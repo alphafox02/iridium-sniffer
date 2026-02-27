@@ -287,6 +287,7 @@ static void *spewer_thread(void *arg) {
 
 static ida_context_t ida_ctx;
 static ida_context_t acars_ida_ctx;
+static ida_context_t mtpos_ida_ctx;
 
 static atomic_ulong gsmtap_sent_count = 0;
 
@@ -320,7 +321,7 @@ static void *frame_consumer_thread(void *arg) {
             /* Try IDA decode if parsed output or GSMTAP is active */
             int ida_ok = 0;
             ida_burst_t burst;
-            if (parsed_mode || gsmtap_enabled || acars_enabled)
+            if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled)
                 ida_ok = ida_decode(demod, &burst);
 
             /* Output: parsed IDA line if available, otherwise RAW */
@@ -358,6 +359,13 @@ static void *frame_consumer_thread(void *arg) {
                     ida_reassemble(&acars_ida_ctx, &burst,
                                    acars_ida_cb, NULL);
                 ida_reassemble_flush(&acars_ida_ctx, demod->timestamp);
+            }
+
+            if (web_enabled) {
+                if (ida_ok)
+                    ida_reassemble(&mtpos_ida_ctx, &burst,
+                                   mtpos_ida_cb, NULL);
+                ida_reassemble_flush(&mtpos_ida_ctx, demod->timestamp);
             }
 
             free(demod->bits);
@@ -583,7 +591,7 @@ int main(int argc, char **argv) {
     if (web_enabled || gsmtap_enabled || position_enabled)
         frame_decode_init();
 
-    if (parsed_mode || gsmtap_enabled || acars_enabled)
+    if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled)
         ida_decode_init();
 
     if (position_enabled) {
