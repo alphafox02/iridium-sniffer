@@ -148,10 +148,21 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
             warnx("Unable to set SoapySDR bandwidth (continuing anyway)");
     }
 
+    /* Bias tee and custom settings are applied AFTER stream activation
+     * in soapy_stream_thread(). Some drivers (SDRPlay) segfault if
+     * writeSetting is called before activateStream / sdrplay_api_Init(). */
+
+    return device;
+}
+
+/* Apply bias tee and custom device settings.
+ * Called after activateStream so SDRPlay driver is fully initialized. */
+static void soapy_apply_settings(SoapySDRDevice *device) {
     if (bias_tee) {
         /* Find the correct bias tee setting key for this device.
          * Different SoapySDR drivers use different names:
-         * Airspy/RTL-SDR: "biastee", bladeRF: "biastee_rx", HackRF: "bias_tx" */
+         * Airspy/RTL-SDR: "biastee", bladeRF: "biastee_rx", HackRF: "bias_tx",
+         * SDRPlay: "biasT_ctrl" */
         size_t num_settings = 0;
         SoapySDRArgInfo *settings = SoapySDRDevice_getSettingInfo(device, &num_settings);
         int found = 0;
@@ -197,8 +208,6 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
                     soapy_setting_keys[i], soapy_setting_vals[i]);
         }
     }
-
-    return device;
 }
 
 static void soapy_cs16_to_float(int16_t *in, float *out, size_t num_samples) {
@@ -256,6 +265,11 @@ void *soapy_stream_thread(void *arg) {
 
     if (SoapySDRDevice_activateStream(device, stream, 0, 0, 0) != 0)
         errx(1, "Unable to activate SoapySDR stream: %s", SoapySDRDevice_lastError());
+
+    /* Apply bias tee and custom settings after stream activation.
+     * SDRPlay devices require sdrplay_api_Init() (called by activateStream)
+     * before writeSetting can be used safely. */
+    soapy_apply_settings(device);
 
     int16_t *cs16_buf = NULL;
     if (sample_mode == 2) {
