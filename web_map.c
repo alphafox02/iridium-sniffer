@@ -728,7 +728,8 @@ static const char HTML_PAGE[] =
 "}\n"
 "\n"
 "function connect(){\n"
-"  var es=new EventSource('/api/events');\n"
+"  var base=window.location.href.split('#')[0].split('?')[0].replace(/\\/?$/,'/');\n"
+"  var es=new EventSource(base+'api/events');\n"
 "  es.addEventListener('update',function(e){\n"
 "    try{update(JSON.parse(e.data))}catch(err){}\n"
 "  });\n"
@@ -820,6 +821,10 @@ static void *client_thread(void *arg)
     char *path = buf + 4;
     char *end = strchr(path, ' ');
     if (end) *end = '\0';
+
+    /* Strip query string — reverse proxies may append ?... parameters */
+    char *qs = strchr(path, '?');
+    if (qs) *qs = '\0';
 
     if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         send_response(fd, "200 OK", "text/html",
