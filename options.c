@@ -82,6 +82,7 @@ extern int position_enabled;
 extern double position_height;
 extern int acars_enabled;
 extern int acars_json;
+extern int voice_enabled;
 extern char *station_id;
 #define ACARS_UDP_MAX 4
 extern char *acars_udp_hosts[ACARS_UDP_MAX];
@@ -134,6 +135,7 @@ static void usage(int exitcode) {
 "    --web[=PORT]            enable live web map (default port: 8888)\n"
 "    --position[=HEIGHT_M]   estimate receiver position from Doppler shift\n"
 "                             optional height aiding in meters (implies --web)\n"
+"    --voice                 decode Iridium voice calls (AMBE, implies --web)\n"
 "\n"
 "GSMTAP:\n"
 "    --gsmtap[=HOST:PORT]    send IDA frames as GSMTAP/LAPDm via UDP\n"
@@ -215,6 +217,7 @@ void parse_options(int argc, char **argv) {
         OPT_STATION,
         OPT_SOAPY_SETTING,
         OPT_ZMQ,
+        OPT_VOICE,
     };
 
     static const struct option longopts[] = {
@@ -253,6 +256,7 @@ void parse_options(int argc, char **argv) {
         { "station",        required_argument, NULL, OPT_STATION },
         { "soapy-setting",  required_argument, NULL, OPT_SOAPY_SETTING },
         { "zmq",            optional_argument, NULL, OPT_ZMQ },
+        { "voice",          no_argument,       NULL, OPT_VOICE },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -496,6 +500,11 @@ void parse_options(int argc, char **argv) {
 #else
                 errx(1, "--soapy-setting requires SoapySDR support");
 #endif
+                break;
+
+            case OPT_VOICE:
+                voice_enabled = 1;
+                web_enabled = 1;  /* voice implies web UI */
                 break;
 
             case 'h':

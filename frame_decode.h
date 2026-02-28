@@ -1,5 +1,5 @@
 /*
- * Iridium frame decoder (IRA/IBC)
+ * Iridium frame decoder (IRA/IBC/VOC)
  * Based on iridium-toolkit bitsparser.py (muccc)
  *
  * Copyright (c) 2026 CEMAXECUTER LLC
@@ -7,8 +7,8 @@
  */
 
 /*
- * Iridium frame decoder: BCH, de-interleave, IRA/IBC field extraction
- * Parses demodulated bits into structured frame data for web map display.
+ * Iridium frame decoder: BCH, de-interleave, IRA/IBC/VOC field extraction
+ * Parses demodulated bits into structured frame data.
  */
 
 #ifndef __FRAME_DECODE_H__
@@ -17,10 +17,13 @@
 #include <stdint.h>
 #include "qpsk_demod.h"
 
+#define VOC_PAYLOAD_BYTES 39    /* 312 bits = 39 bytes per voice superframe */
+
 typedef enum {
     FRAME_UNKNOWN = 0,
     FRAME_IRA,
     FRAME_IBC,
+    FRAME_VOC,
 } frame_type_t;
 
 typedef struct {
@@ -46,19 +49,26 @@ typedef struct {
 } ibc_data_t;
 
 typedef struct {
+    uint8_t payload[VOC_PAYLOAD_BYTES]; /* 39 bytes of AMBE superframe data */
+    int ft;                 /* LCW frame type (0=voice) */
+    int confidence;         /* demodulator confidence for this frame */
+} voc_data_t;
+
+typedef struct {
     frame_type_t type;
     uint64_t timestamp;
     double frequency;
     union {
         ira_data_t ira;
         ibc_data_t ibc;
+        voc_data_t voc;
     };
 } decoded_frame_t;
 
 /* Initialize BCH syndrome tables. Call once at startup. */
 void frame_decode_init(void);
 
-/* Decode a demodulated frame. Returns 1 if IRA or IBC detected, 0 otherwise. */
+/* Decode a demodulated frame. Returns 1 if frame detected, 0 otherwise. */
 int frame_decode(const demod_frame_t *frame, decoded_frame_t *out);
 
 /* BCH utility functions (shared with ida_decode.c) */

@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -36,6 +37,7 @@
 
 #include "web_map.h"
 #include "ida_decode.h"
+#include "voice_decode.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -460,9 +462,15 @@ static int build_json(char *buf, int bufsize)
             state.rx_lat, state.rx_lon, state.rx_hdop);
     }
 
+    pthread_mutex_unlock(&state.lock);
+
+    /* Voice stats (uses separate lock, safe outside state.lock) */
+    off += snprintf(buf + off, bufsize - off,
+        ",\"total_voc\":%d,\"total_voice_calls\":%d",
+        voice_decode_total_frames(), voice_decode_total_calls());
+
     off += snprintf(buf + off, bufsize - off, "}");
 
-    pthread_mutex_unlock(&state.lock);
     return off;
 }
 
@@ -505,18 +513,71 @@ static const char HTML_PAGE[] =
 ".leaflet-control-layers{background:rgba(15,23,42,0.92)!important;\n"
 "  color:#e2e8f0!important;border:1px solid #334155!important}\n"
 ".leaflet-control-layers label{color:#e2e8f0}\n"
+".tab{cursor:pointer;padding:0 12px;line-height:42px;color:#64748b;\n"
+"  border-bottom:2px solid transparent;margin-bottom:-1px}\n"
+".tab.active{color:#38bdf8;border-bottom-color:#38bdf8}\n"
+".tab:hover{color:#94a3b8}\n"
+".badge{background:#38bdf8;color:#0f172a;font-size:11px;\n"
+"  padding:1px 7px;border-radius:10px;margin-left:4px;font-weight:600}\n"
+"#calls-panel{width:100vw;height:calc(100vh - 44px);overflow-y:auto;\n"
+"  padding:16px 24px;background:#0f172a;display:none}\n"
+".ct{width:100%;max-width:1200px;margin:0 auto;border-collapse:collapse}\n"
+".ct th{text-align:left;padding:10px 16px;color:#64748b;font-size:12px;\n"
+"  text-transform:uppercase;letter-spacing:.5px;\n"
+"  border-bottom:1px solid #1e293b;font-weight:500}\n"
+".ct td{padding:12px 16px;border-bottom:1px solid #1e293b;\n"
+"  font-size:14px;color:#e2e8f0}\n"
+".ct tr:hover{background:#1e293b;cursor:pointer}\n"
+".ct tr.playing{background:#1e3a5f}\n"
+".qb{padding:3px 10px;border-radius:12px;font-size:12px;font-weight:500}\n"
+".qb.good{background:#064e3b;color:#34d399}\n"
+".qb.fair{background:#422006;color:#fbbf24}\n"
+".qb.poor{background:#450a0a;color:#f87171}\n"
+".pbtn{width:32px;height:32px;border-radius:50%;border:none;\n"
+"  background:#38bdf8;color:#0f172a;cursor:pointer;font-size:14px;\n"
+"  display:flex;align-items:center;justify-content:center}\n"
+".pbtn:hover{background:#7dd3fc}\n"
+".pbtn.on{background:#22c55e}\n"
+"#pbar{position:fixed;bottom:0;left:0;right:0;background:#1e293b;\n"
+"  border-top:1px solid #334155;padding:12px 24px;display:none;\n"
+"  align-items:center;gap:16px;z-index:2000}\n"
+".pi{flex:1}.pt{font-size:14px;color:#e2e8f0}\n"
+".ps{font-size:12px;color:#64748b}\n"
+".pp{flex:3;height:4px;background:#334155;border-radius:2px;\n"
+"  cursor:pointer;position:relative}\n"
+".pf{height:100%;background:#38bdf8;border-radius:2px;width:0}\n"
+".ptm{font-size:12px;color:#64748b;min-width:80px;text-align:right}\n"
+".no-calls{text-align:center;color:#64748b;padding:48px 0;font-size:14px}\n"
+".freq{color:#94a3b8;font-variant-numeric:tabular-nums;font-size:13px}\n"
+".dur{font-variant-numeric:tabular-nums}\n"
 "</style></head><body>\n"
 "<div id=\"bar\">\n"
 "  <span class=\"title\">iridium-sniffer</span>\n"
+"  <span class=\"tab active\" id=\"tab-map\" onclick=\"showTab('map')\">Map</span>\n"
+"  <span class=\"tab\" id=\"tab-calls\" onclick=\"showTab('calls')\">Calls"
+"<span id=\"cbadge\" class=\"badge\" style=\"display:none\">0</span></span>\n"
 "  <span class=\"stat\">Beams <span id=\"n-beams\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">MT <span id=\"n-mt\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">Pages <span id=\"n-pages\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">Sats <span id=\"n-sats\" class=\"val\">0</span></span>\n"
 "  <span class=\"stat\">IRA <span id=\"n-ira\" class=\"val\">0</span></span>\n"
+"  <span class=\"stat\" id=\"voc-stat\" style=\"display:none\">"
+"VOC <span id=\"n-voc\" class=\"val\">0</span></span>\n"
 "  <span id=\"status\" style=\"color:#64748b\">connecting...</span>\n"
 "</div>\n"
 "<div id=\"map\"></div>\n"
-"<div class=\"legend\">\n"
+"<div id=\"calls-panel\">\n"
+"  <table class=\"ct\"><thead><tr>\n"
+"    <th style=\"width:50px\"></th>\n"
+"    <th>Time</th><th>Duration</th><th>Frequency</th>\n"
+"    <th>Frames</th><th>Quality</th>\n"
+"  </tr></thead>\n"
+"  <tbody id=\"calls-tbody\">\n"
+"    <tr><td colspan=\"6\" class=\"no-calls\">"
+"No voice calls detected yet</td></tr>\n"
+"  </tbody></table>\n"
+"</div>\n"
+"<div class=\"legend\" id=\"legend\">\n"
 "  <div class=\"legend-title\">Map</div>\n"
 "  <div class=\"legend-row\">\n"
 "    <span class=\"legend-swatch\" style=\"width:16px;height:16px;\n"
@@ -539,6 +600,17 @@ static const char HTML_PAGE[] =
 "      border-radius:50%;background:#22c55e\"></span>\n"
 "    Receiver position\n"
 "  </div>\n"
+"</div>\n"
+"<div id=\"pbar\">\n"
+"  <button class=\"pbtn on\" id=\"pb-btn\" onclick=\"togglePlay()\""
+" style=\"width:36px;height:36px;font-size:16px\">&#9654;</button>\n"
+"  <div class=\"pi\">\n"
+"    <div class=\"pt\" id=\"pb-title\"></div>\n"
+"    <div class=\"ps\" id=\"pb-sub\"></div>\n"
+"  </div>\n"
+"  <div class=\"pp\" onclick=\"seekAudio(event)\">"
+"<div class=\"pf\" id=\"pb-fill\"></div></div>\n"
+"  <div class=\"ptm\" id=\"pb-time\">0:00 / 0:00</div>\n"
 "</div>\n"
 "<script>\n"
 "var map=L.map('map',{zoomControl:true}).setView([20,0],2);\n"
@@ -569,6 +641,124 @@ static const char HTML_PAGE[] =
 "map.on('popupopen',function(){popupOpen=true});\n"
 "map.on('popupclose',function(){popupOpen=false});\n"
 "\n"
+"var activeTab='map';\n"
+"function showTab(t){\n"
+"  activeTab=t;\n"
+"  document.getElementById('map').style.display=t==='map'?'block':'none';\n"
+"  document.getElementById('legend').style.display=t==='map'?'block':'none';\n"
+"  document.getElementById('calls-panel').style.display=t==='calls'?'block':'none';\n"
+"  document.getElementById('tab-map').className=t==='map'?'tab active':'tab';\n"
+"  document.getElementById('tab-calls').className=t==='calls'?'tab active':'tab';\n"
+"  if(t==='map')map.invalidateSize();\n"
+"  if(t==='calls')fetchCalls();\n"
+"}\n"
+"\n"
+"var callsData=[];\n"
+"var curPlay=-1;\n"
+"var au=new Audio();\n"
+"\n"
+"function fetchCalls(){\n"
+"  fetch('/api/calls').then(function(r){return r.json()}).then(function(d){\n"
+"    callsData=d.calls||[];\n"
+"    var b=document.getElementById('cbadge');\n"
+"    if(d.total_calls>0){b.textContent=d.total_calls;b.style.display='';}\n"
+"    if(d.total_voc_frames>0){\n"
+"      document.getElementById('voc-stat').style.display='';\n"
+"      document.getElementById('n-voc').textContent=d.total_voc_frames;\n"
+"    }\n"
+"    renderCalls();\n"
+"  }).catch(function(){});\n"
+"}\n"
+"\n"
+"function fmtD(ms){\n"
+"  var s=Math.floor(ms/1000);var m=Math.floor(s/60);s=s%60;\n"
+"  return m>0?m+'m '+s+'s':s+'s';\n"
+"}\n"
+"function fmtT(ts){\n"
+"  var d=new Date(ts*1000);\n"
+"  var h=d.getHours(),m=d.getMinutes(),s=d.getSeconds();\n"
+"  return ('0'+h).slice(-2)+':'+('0'+m).slice(-2)+':'+('0'+s).slice(-2);\n"
+"}\n"
+"function fmtF(hz){return (hz/1e6).toFixed(3)+' MHz'}\n"
+"\n"
+"function renderCalls(){\n"
+"  var tb=document.getElementById('calls-tbody');\n"
+"  if(!callsData.length){\n"
+"    tb.innerHTML='<tr><td colspan=\"6\" class=\"no-calls\">'"
+"+'No voice calls detected yet</td></tr>';\n"
+"    return;\n"
+"  }\n"
+"  var h='';\n"
+"  for(var i=0;i<callsData.length;i++){\n"
+"    var c=callsData[i];\n"
+"    var p=curPlay===c.id;\n"
+"    var pa=p&&!au.paused;\n"
+"    var q=['good','fair','poor'][c.quality]||'poor';\n"
+"    var ql=['Good','Fair','Poor'][c.quality]||'Poor';\n"
+"    h+='<tr class=\"'+(p?'playing':'')+'\" onclick=\"playCall('+c.id+')\">';\n"
+"    h+='<td><button class=\"pbtn '+(pa?'on':'')+'\">';\n"
+"    h+=(pa?'&#9646;&#9646;':'&#9654;')+'</button></td>';\n"
+"    h+='<td>'+fmtT(c.t)+'</td>';\n"
+"    var aDur=Math.round(c.samples/8);\n"
+"    h+='<td class=\"dur\">'+fmtD(aDur)+'</td>';\n"
+"    h+='<td class=\"freq\">'+fmtF(c.freq)+'</td>';\n"
+"    h+='<td>'+c.frames+'</td>';\n"
+"    h+='<td><span class=\"qb '+q+'\">'+ql+'</span></td>';\n"
+"    h+='</tr>';\n"
+"  }\n"
+"  tb.innerHTML=h;\n"
+"}\n"
+"\n"
+"function playCall(id){\n"
+"  var bar=document.getElementById('pbar');\n"
+"  if(curPlay===id){\n"
+"    if(au.paused)au.play();else au.pause();\n"
+"    renderCalls();return;\n"
+"  }\n"
+"  curPlay=id;au.src='/api/calls/'+id+'/audio';au.play();\n"
+"  bar.style.display='flex';\n"
+"  var c=null;\n"
+"  for(var i=0;i<callsData.length;i++){"
+"if(callsData[i].id===id){c=callsData[i];break;}}\n"
+"  if(c){\n"
+"    document.getElementById('pb-title').textContent="
+"'Call #'+c.id+' - '+fmtF(c.freq);\n"
+"    document.getElementById('pb-sub').textContent="
+"fmtT(c.t)+' - '+c.frames+' frames, '\n"
+"      +['Good','Fair','Poor'][c.quality]+' quality';\n"
+"  }\n"
+"  renderCalls();\n"
+"}\n"
+"\n"
+"function togglePlay(){if(au.paused)au.play();else au.pause()}\n"
+"function seekAudio(e){\n"
+"  if(!au.duration)return;\n"
+"  var r=e.currentTarget.getBoundingClientRect();\n"
+"  au.currentTime=(e.clientX-r.left)/r.width*au.duration;\n"
+"}\n"
+"\n"
+"au.addEventListener('timeupdate',function(){\n"
+"  if(!au.duration)return;\n"
+"  document.getElementById('pb-fill').style.width=\n"
+"    (au.currentTime/au.duration*100)+'%';\n"
+"  var c=Math.floor(au.currentTime),t=Math.floor(au.duration);\n"
+"  document.getElementById('pb-time').textContent=\n"
+"    Math.floor(c/60)+':'+('0'+c%60).slice(-2)+' / '+\n"
+"    Math.floor(t/60)+':'+('0'+t%60).slice(-2);\n"
+"});\n"
+"au.addEventListener('ended',function(){\n"
+"  curPlay=-1;document.getElementById('pbar').style.display='none';\n"
+"  renderCalls();\n"
+"});\n"
+"au.addEventListener('pause',function(){\n"
+"  document.getElementById('pb-btn').innerHTML='&#9654;';renderCalls();\n"
+"});\n"
+"au.addEventListener('play',function(){\n"
+"  document.getElementById('pb-btn').innerHTML='&#9646;&#9646;';renderCalls();\n"
+"});\n"
+"\n"
+"setInterval(function(){if(activeTab==='calls')fetchCalls()},5000);\n"
+"\n"
 "function update(d){\n"
 "  document.getElementById('n-ira').textContent=d.total_ira;\n"
 "  document.getElementById('n-beams').textContent=d.total_beams||0;\n"
@@ -576,6 +766,13 @@ static const char HTML_PAGE[] =
 "  document.getElementById('n-pages').textContent=d.total_pages;\n"
 "  document.getElementById('status').style.color='#22c55e';\n"
 "  document.getElementById('status').textContent='live';\n"
+"\n"
+"  if(d.total_voc>0){\n"
+"    document.getElementById('voc-stat').style.display='';\n"
+"    document.getElementById('n-voc').textContent=d.total_voc;\n"
+"  }\n"
+"  var cb=document.getElementById('cbadge');\n"
+"  if(d.total_voice_calls>0){cb.textContent=d.total_voice_calls;cb.style.display='';}\n"
 "\n"
 "  if(popupOpen)return;\n"
 "\n"
@@ -846,6 +1043,95 @@ static void *client_thread(void *arg)
             int jlen = build_json(json, JSON_BUF_SIZE);
             send_response(fd, "200 OK", "application/json", json, jlen);
             free(json);
+        }
+        close(fd);
+    } else if (strcmp(path, "/api/calls") == 0) {
+        /* Voice calls JSON list */
+        int n_calls = voice_decode_call_count();
+        int bufsize = 256 + n_calls * 256;
+        char *json = malloc(bufsize);
+        if (json) {
+            int pos = 0;
+            pos += snprintf(json + pos, bufsize - pos,
+                "{\"total_calls\":%d,\"total_voc_frames\":%d,\"calls\":[",
+                voice_decode_total_calls(), voice_decode_total_frames());
+            for (int i = n_calls - 1; i >= 0 && pos < bufsize - 256; i--) {
+                const voice_call_t *c = voice_decode_get_call(i);
+                if (!c) continue;
+                int dur_ms = (int)((c->end_time - c->start_time) / 1000000ULL);
+                if (i < n_calls - 1) pos += snprintf(json + pos, bufsize - pos, ",");
+                pos += snprintf(json + pos, bufsize - pos,
+                    "{\"id\":%d,\"t\":%lu,\"dur\":%d,"
+                    "\"freq\":%.0f,\"frames\":%d,"
+                    "\"quality\":%d,\"samples\":%d}",
+                    c->call_id,
+                    (unsigned long)(c->start_time / 1000000000ULL),
+                    dur_ms, c->frequency, c->n_frames,
+                    (int)c->quality, c->n_samples);
+            }
+            pos += snprintf(json + pos, bufsize - pos, "]}");
+            send_response(fd, "200 OK", "application/json", json, pos);
+            free(json);
+        }
+        close(fd);
+    } else if (strncmp(path, "/api/calls/", 11) == 0) {
+        /* Voice call audio: /api/calls/N/audio */
+        int call_id = -1;
+        if (sscanf(path + 11, "%d/audio", &call_id) == 1 && call_id >= 0) {
+            /* Find call by ID */
+            const voice_call_t *call = NULL;
+            int n_calls = voice_decode_call_count();
+            for (int i = 0; i < n_calls; i++) {
+                const voice_call_t *c = voice_decode_get_call(i);
+                if (c && c->call_id == call_id) { call = c; break; }
+            }
+            if (call && call->audio && call->n_samples > 0) {
+                /* Build WAV file in memory */
+                int data_size = call->n_samples * 2;
+                int wav_size = 44 + data_size;
+                uint8_t *wav = malloc(wav_size);
+                if (wav) {
+                    /* RIFF header */
+                    memcpy(wav, "RIFF", 4);
+                    uint32_t chunk_size = wav_size - 8;
+                    memcpy(wav + 4, &chunk_size, 4);
+                    memcpy(wav + 8, "WAVE", 4);
+                    /* fmt subchunk */
+                    memcpy(wav + 12, "fmt ", 4);
+                    uint32_t fmt_size = 16;
+                    memcpy(wav + 16, &fmt_size, 4);
+                    uint16_t audio_fmt = 1; /* PCM */
+                    memcpy(wav + 20, &audio_fmt, 2);
+                    uint16_t channels = 1;
+                    memcpy(wav + 22, &channels, 2);
+                    uint32_t sample_rate = VOICE_SAMPLE_RATE;
+                    memcpy(wav + 24, &sample_rate, 4);
+                    uint32_t byte_rate = VOICE_SAMPLE_RATE * 2;
+                    memcpy(wav + 28, &byte_rate, 4);
+                    uint16_t block_align = 2;
+                    memcpy(wav + 32, &block_align, 2);
+                    uint16_t bits_per_sample = 16;
+                    memcpy(wav + 34, &bits_per_sample, 2);
+                    /* data subchunk */
+                    memcpy(wav + 36, "data", 4);
+                    uint32_t data_sz = data_size;
+                    memcpy(wav + 40, &data_sz, 4);
+                    memcpy(wav + 44, call->audio, data_size);
+
+                    send_response(fd, "200 OK", "audio/wav",
+                                  (char *)wav, wav_size);
+                    free(wav);
+                } else {
+                    send_response(fd, "500 Internal Server Error",
+                                  "text/plain", "OOM", 3);
+                }
+            } else {
+                send_response(fd, "404 Not Found", "text/plain",
+                              "call not found", 14);
+            }
+        } else {
+            send_response(fd, "400 Bad Request", "text/plain",
+                          "bad call id", 11);
         }
         close(fd);
     } else {

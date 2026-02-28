@@ -190,7 +190,7 @@ static void de_interleave_llr_n(const float *in, int n_sym,
 
 /* ---- LCW extraction ---- */
 
-static int decode_lcw(const uint8_t *data, int data_len, lcw_t *lcw)
+int decode_lcw(const uint8_t *data, int data_len, lcw_t *lcw)
 {
     if (data_len < 46)
         return 0;

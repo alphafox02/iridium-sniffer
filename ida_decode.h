@@ -80,6 +80,10 @@ typedef void (*ida_message_cb)(const uint8_t *data, int len,
 /* Initialize IDA BCH syndrome tables. Call once at startup. */
 void ida_decode_init(void);
 
+/* Decode LCW (Link Control Word) from 46 raw demodulated bits.
+ * Returns 1 on success, 0 on failure. Handles pair-swap and BCH error correction. */
+int decode_lcw(const uint8_t *data, int data_len, lcw_t *lcw);
+
 /* Try to decode a demodulated frame as IDA.
  * Returns 1 if IDA detected, fills burst. 0 otherwise. */
 int ida_decode(const demod_frame_t *frame, ida_burst_t *burst);

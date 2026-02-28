@@ -47,6 +47,7 @@
 #include "web_map.h"
 #include "ida_decode.h"
 #include "doppler_pos.h"
+#include "voice_decode.h"
 #include "gsmtap.h"
 #include "sbd_acars.h"
 #include "fftw_lock.h"
@@ -145,6 +146,7 @@ int parsed_mode = 0;
 int position_enabled = 0;
 double position_height = 0;
 int acars_enabled = 0;
+int voice_enabled = 0;
 char *station_id = NULL;
 
 /* Multiple UDP endpoints for ACARS JSON streaming */
@@ -330,7 +332,7 @@ static void *frame_consumer_thread(void *arg) {
             else
                 frame_output_print(demod);
 
-            if (web_enabled || position_enabled) {
+            if (web_enabled || position_enabled || voice_enabled) {
                 decoded_frame_t decoded;
                 if (frame_decode(demod, &decoded)) {
                     if (decoded.type == FRAME_IRA) {
@@ -344,6 +346,11 @@ static void *frame_consumer_thread(void *arg) {
                     } else if (decoded.type == FRAME_IBC) {
                         if (web_enabled)
                             web_map_add_sat(&decoded.ibc, decoded.timestamp);
+                    } else if (decoded.type == FRAME_VOC) {
+                        if (voice_enabled)
+                            voice_decode_add_frame(&decoded.voc,
+                                                    decoded.timestamp,
+                                                    decoded.frequency);
                     }
                 }
             }
@@ -588,10 +595,13 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    if (web_enabled || gsmtap_enabled || position_enabled)
+    if (web_enabled || gsmtap_enabled || position_enabled || voice_enabled)
         frame_decode_init();
 
-    if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled)
+    if (voice_enabled)
+        voice_decode_init();
+
+    if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled || voice_enabled)
         ida_decode_init();
 
     if (position_enabled) {
@@ -792,6 +802,9 @@ int main(int argc, char **argv) {
     blocking_queue_close(&frame_queue);
     pthread_join(frame_consumer, NULL);
     pthread_join(stats, NULL);
+
+    if (voice_enabled)
+        voice_decode_shutdown();
 
     if (web_enabled)
         web_map_shutdown();

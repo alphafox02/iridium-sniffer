@@ -117,6 +117,14 @@ set(SOURCES
     ${PROJECT_SOURCE_DIR}/sbd_acars.c
     ${PROJECT_SOURCE_DIR}/window_func.c
     ${PROJECT_SOURCE_DIR}/simd_generic.c
+    ${PROJECT_SOURCE_DIR}/voice_decode.c
+    ${PROJECT_SOURCE_DIR}/codec/ambe.c
+    ${PROJECT_SOURCE_DIR}/codec/ecc.c
+    ${PROJECT_SOURCE_DIR}/codec/frame.c
+    ${PROJECT_SOURCE_DIR}/codec/math.c
+    ${PROJECT_SOURCE_DIR}/codec/synth.c
+    ${PROJECT_SOURCE_DIR}/codec/tables.c
+    ${PROJECT_SOURCE_DIR}/codec/tone.c
 )
 
 # AVX2 SIMD kernels (x86_64 only, compiled with -mavx2 -mfma)

@@ -26,6 +26,7 @@
 #include <stdio.h>
 
 #include "frame_decode.h"
+#include "ida_decode.h"
 #include "iridium.h"
 
 #ifndef M_PI
@@ -590,6 +591,45 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
 
             out->type = FRAME_IRA;
             parse_ira(bch_stream, bch_len, &out->ira);
+            return 1;
+        }
+    }
+
+    /* ---- Try LCW (Link Control Word) detection ----
+     * Duplex channel frames (voice, data, signaling) use a 46-bit
+     * interleaved LCW header followed by 312 bits of payload.
+     * Detection: de-interleave 46 bits into 3 fields (lcw1/lcw2/lcw3),
+     * validate with GF(2) polynomial remainder checks.
+     * Reference: iridium-toolkit bitsparser.py de_interleave_lcw() */
+    if (data_len >= 46 + 312) {
+        /* Use the proper LCW decoder from ida_decode.c which handles
+         * pair-swap, BCH error correction, and correct field boundaries. */
+        lcw_t lcw;
+        if (decode_lcw(data, data_len, &lcw) && lcw.ft == 0) {
+            out->type = FRAME_VOC;
+            out->voc.ft = lcw.ft;
+            out->voc.confidence = frame->confidence;
+
+            /* Extract 312-bit payload after the 46-bit LCW header.
+             * Apply symbol-pair swap: QPSK demod outputs [MSB,LSB]
+             * but the air interface uses [LSB,MSB]. IRA/IBC have
+             * de-interleave which compensates, but VOC needs explicit
+             * swap. Then pack LSB-first for osmo_pbit2ubit_ext(lsb_mode=1).
+             * Verified byte-identical to iridium-toolkit bits_to_dfs.py. */
+            const uint8_t *payload = data + 46;
+            uint8_t swapped[312];
+            for (int i = 0; i < 312; i += 2) {
+                swapped[i]     = payload[i + 1];
+                swapped[i + 1] = payload[i];
+            }
+            for (int i = 0; i < VOC_PAYLOAD_BYTES; i++) {
+                uint8_t b = 0;
+                for (int j = 0; j < 8; j++) {
+                    if (swapped[i * 8 + j])
+                        b |= (1 << j);
+                }
+                out->voc.payload[i] = b;
+            }
             return 1;
         }
     }
