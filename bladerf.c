@@ -23,6 +23,8 @@ extern double samp_rate;
 extern double center_freq;
 extern int bladerf_gain_val;
 extern int bias_tee;
+extern int clock_source;
+extern int verbose;
 
 unsigned timeouts = 0;
 int num_samples_workaround = 0;
@@ -78,6 +80,26 @@ struct bladerf *bladerf_setup(int id) {
             errx(1, "Unable to enable bladeRF bias tee: %s", bladerf_strerror(status));
     }
 
+    /* Configure VCTCXO tamer from external reference */
+    if (clock_source == CLOCK_SRC_EXTERNAL) {
+        status = bladerf_set_vctcxo_tamer_mode(bladerf,
+                                                BLADERF_VCTCXO_TAMER_10_MHZ);
+        if (status != 0)
+            warnx("Unable to set bladeRF VCTCXO tamer to 10 MHz: %s",
+                  bladerf_strerror(status));
+        else if (verbose)
+            fprintf(stderr, "bladeRF: VCTCXO tamer set to 10 MHz external\n");
+    } else if (clock_source == CLOCK_SRC_GPSDO) {
+        /* GPSDO typically provides 1 PPS */
+        status = bladerf_set_vctcxo_tamer_mode(bladerf,
+                                                BLADERF_VCTCXO_TAMER_1_PPS);
+        if (status != 0)
+            warnx("Unable to set bladeRF VCTCXO tamer to 1 PPS: %s",
+                  bladerf_strerror(status));
+        else if (verbose)
+            fprintf(stderr, "bladeRF: VCTCXO tamer set to 1 PPS (GPSDO)\n");
+    }
+
     return bladerf;
 }
 
@@ -91,6 +113,7 @@ void *bladerf_rx_cb(struct bladerf *bladerf, struct bladerf_stream *stream, stru
 
     sample_buf_t *s = malloc(sizeof(*s) + num_samples * sizeof(float) * 2);
     s->format = SAMPLE_FMT_FLOAT;
+    s->hw_timestamp_ns = 0;
     s->num = num_samples;
     float *out = (float *)s->samples;
     for (i = 0; i < num_samples * 2; ++i)

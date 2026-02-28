@@ -20,6 +20,9 @@ extern pid_t self_pid;
 extern double samp_rate;
 extern double center_freq;
 extern int usrp_gain_val;
+extern int clock_source;
+extern int time_source;
+extern int verbose;
 
 #define KVLEN 16
 typedef struct _kv_pair_t {
@@ -141,6 +144,32 @@ uhd_usrp_handle usrp_setup(char *serial) {
     if (error)
         errx(1, "Error opening UHD: %u", error);
 
+    /* Configure clock source */
+    if (clock_source == CLOCK_SRC_EXTERNAL) {
+        if ((error = uhd_usrp_set_clock_source(usrp, "external", 0)) != UHD_ERROR_NONE)
+            errx(1, "Unable to set USRP clock source to external: %u", error);
+        if (verbose)
+            fprintf(stderr, "USRP: clock source set to external\n");
+    } else if (clock_source == CLOCK_SRC_GPSDO) {
+        if ((error = uhd_usrp_set_clock_source(usrp, "gpsdo", 0)) != UHD_ERROR_NONE)
+            errx(1, "Unable to set USRP clock source to gpsdo: %u", error);
+        if (verbose)
+            fprintf(stderr, "USRP: clock source set to gpsdo\n");
+    }
+
+    /* Configure time source */
+    if (time_source == CLOCK_SRC_EXTERNAL) {
+        if ((error = uhd_usrp_set_time_source(usrp, "external", 0)) != UHD_ERROR_NONE)
+            errx(1, "Unable to set USRP time source to external: %u", error);
+        if (verbose)
+            fprintf(stderr, "USRP: time source set to external\n");
+    } else if (time_source == CLOCK_SRC_GPSDO) {
+        if ((error = uhd_usrp_set_time_source(usrp, "gpsdo", 0)) != UHD_ERROR_NONE)
+            errx(1, "Unable to set USRP time source to gpsdo: %u", error);
+        if (verbose)
+            fprintf(stderr, "USRP: time source set to gpsdo\n");
+    }
+
     if ((error = uhd_usrp_set_rx_rate(usrp, samp_rate, 0)) != UHD_ERROR_NONE)
         errx(1, "Unable to set USRP sample rate: %u", error);
     if ((error = uhd_usrp_set_rx_gain(usrp, (double)usrp_gain_val, 0, "")) != UHD_ERROR_NONE)
@@ -183,15 +212,29 @@ void *usrp_stream_thread(void *arg) {
     uhd_rx_streamer_max_num_samps(rx_handle, &num_samples);
     uhd_rx_streamer_issue_stream_cmd(rx_handle, &stream_cmd);
 
+    int hw_time = (time_source != CLOCK_SRC_INTERNAL);
+
     while (running) {
         sample_buf_t *s = malloc(sizeof(*s) + num_samples * 2 * sizeof(int8_t));
         s->format = SAMPLE_FMT_INT8;
+        s->hw_timestamp_ns = 0;
         buf = s->samples;
         uhd_rx_streamer_recv(rx_handle, &buf, num_samples, &md, 3.0, false, &num_rx_samples);
         uhd_rx_metadata_error_code(md, &error_code);
         if (error_code != UHD_RX_METADATA_ERROR_CODE_NONE && error_code != 8)
             errx(1, "Error during streaming: %u", error_code);
         s->num = num_rx_samples;
+
+        /* Extract hardware timestamp when time source is configured */
+        if (hw_time) {
+            int64_t full_secs;
+            double frac_secs;
+            uhd_rx_metadata_time_spec(md, &full_secs, &frac_secs);
+            if (full_secs > 0)
+                s->hw_timestamp_ns = (uint64_t)full_secs * 1000000000ULL
+                                   + (uint64_t)(frac_secs * 1e9);
+        }
+
         if (running)
             push_samples(s);
         else

@@ -24,6 +24,8 @@ extern double center_freq;
 extern double soapy_gain_val;
 extern int bias_tee;
 extern int verbose;
+extern int clock_source;
+extern int time_source;
 
 #define SOAPY_SETTINGS_MAX 8
 extern char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
@@ -146,6 +148,41 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
     if (SoapySDRDevice_setBandwidth(device, SOAPY_SDR_RX, 0, samp_rate) != 0) {
         if (verbose)
             warnx("Unable to set SoapySDR bandwidth (continuing anyway)");
+    }
+
+    /* Configure clock/time source if requested.
+     * Not all SoapySDR drivers support this -- warn on failure instead of
+     * crashing, since SDRPlay and RTL-SDR don't have external references. */
+    if (clock_source == CLOCK_SRC_EXTERNAL) {
+        if (SoapySDRDevice_setClockSource(device, "external") != 0) {
+            if (verbose)
+                warnx("SoapySDR: unable to set clock source to external "
+                      "(device may not support it)");
+        } else if (verbose)
+            fprintf(stderr, "SoapySDR: clock source set to external\n");
+    } else if (clock_source == CLOCK_SRC_GPSDO) {
+        if (SoapySDRDevice_setClockSource(device, "gpsdo") != 0) {
+            if (verbose)
+                warnx("SoapySDR: unable to set clock source to gpsdo "
+                      "(device may not support it)");
+        } else if (verbose)
+            fprintf(stderr, "SoapySDR: clock source set to gpsdo\n");
+    }
+
+    if (time_source == CLOCK_SRC_EXTERNAL) {
+        if (SoapySDRDevice_setTimeSource(device, "external") != 0) {
+            if (verbose)
+                warnx("SoapySDR: unable to set time source to external "
+                      "(device may not support it)");
+        } else if (verbose)
+            fprintf(stderr, "SoapySDR: time source set to external\n");
+    } else if (time_source == CLOCK_SRC_GPSDO) {
+        if (SoapySDRDevice_setTimeSource(device, "gpsdo") != 0) {
+            if (verbose)
+                warnx("SoapySDR: unable to set time source to gpsdo "
+                      "(device may not support it)");
+        } else if (verbose)
+            fprintf(stderr, "SoapySDR: time source set to gpsdo\n");
     }
 
     /* Bias tee and custom settings are applied AFTER stream activation
@@ -282,6 +319,8 @@ void *soapy_stream_thread(void *arg) {
     size_t sample_size = (sample_mode == 0) ? 2 * sizeof(int8_t)
                                             : 2 * sizeof(float);
 
+    int hw_time = (time_source != CLOCK_SRC_INTERNAL);
+
     while (running) {
         sample_buf_t *s = malloc(sizeof(*s) + mtu * sample_size);
         if (s == NULL) {
@@ -329,6 +368,7 @@ void *soapy_stream_thread(void *arg) {
 
         s->format = (sample_mode == 0) ? SAMPLE_FMT_INT8 : SAMPLE_FMT_FLOAT;
         s->num = ret;
+        s->hw_timestamp_ns = (hw_time && time_ns > 0) ? (uint64_t)time_ns : 0;
         if (running)
             push_samples(s);
         else

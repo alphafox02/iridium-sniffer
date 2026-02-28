@@ -16,6 +16,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "sdr.h"
+
 #ifdef HAVE_HACKRF
 #include "hackrf.h"
 #endif
@@ -93,6 +95,8 @@ extern char *feed_tcp_host;
 extern int feed_tcp_port;
 extern int zmq_enabled;
 extern char *zmq_endpoint;
+extern int clock_source;
+extern int time_source;
 
 static void usage(int exitcode) {
     fprintf(stderr,
@@ -112,6 +116,8 @@ static void usage(int exitcode) {
 "    -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)\n"
 "    -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)\n"
 "    -B, --bias-tee           enable bias tee power\n"
+"    --clock-source=SRC       clock reference: internal (default), external, gpsdo\n"
+"    --time-source=SRC        time/PPS reference: internal (default), external, gpsdo\n"
 "\n"
 "Gain options:\n"
 "    --hackrf-lna=GAIN       HackRF LNA gain in dB (default: 40)\n"
@@ -215,6 +221,8 @@ void parse_options(int argc, char **argv) {
         OPT_STATION,
         OPT_SOAPY_SETTING,
         OPT_ZMQ,
+        OPT_CLOCK_SOURCE,
+        OPT_TIME_SOURCE,
     };
 
     static const struct option longopts[] = {
@@ -253,6 +261,8 @@ void parse_options(int argc, char **argv) {
         { "station",        required_argument, NULL, OPT_STATION },
         { "soapy-setting",  required_argument, NULL, OPT_SOAPY_SETTING },
         { "zmq",            optional_argument, NULL, OPT_ZMQ },
+        { "clock-source",   required_argument, NULL, OPT_CLOCK_SOURCE },
+        { "time-source",    required_argument, NULL, OPT_TIME_SOURCE },
         { NULL,             0,                 NULL, 0 }
     };
 
@@ -496,6 +506,30 @@ void parse_options(int argc, char **argv) {
 #else
                 errx(1, "--soapy-setting requires SoapySDR support");
 #endif
+                break;
+
+            case OPT_CLOCK_SOURCE:
+                if (strcmp(optarg, "internal") == 0)
+                    clock_source = CLOCK_SRC_INTERNAL;
+                else if (strcmp(optarg, "external") == 0)
+                    clock_source = CLOCK_SRC_EXTERNAL;
+                else if (strcmp(optarg, "gpsdo") == 0)
+                    clock_source = CLOCK_SRC_GPSDO;
+                else
+                    errx(1, "Unknown clock source '%s'. "
+                         "Use internal, external, or gpsdo.", optarg);
+                break;
+
+            case OPT_TIME_SOURCE:
+                if (strcmp(optarg, "internal") == 0)
+                    time_source = CLOCK_SRC_INTERNAL;
+                else if (strcmp(optarg, "external") == 0)
+                    time_source = CLOCK_SRC_EXTERNAL;
+                else if (strcmp(optarg, "gpsdo") == 0)
+                    time_source = CLOCK_SRC_GPSDO;
+                else
+                    errx(1, "Unknown time source '%s'. "
+                         "Use internal, external, or gpsdo.", optarg);
                 break;
 
             case 'h':

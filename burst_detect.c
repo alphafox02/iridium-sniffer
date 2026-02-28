@@ -123,6 +123,7 @@ struct _burst_detector {
 
     /* Timestamp */
     uint64_t start_time_ns;     /* nanosecond timestamp at sample 0 */
+    uint64_t pending_hw_ts;     /* hardware timestamp for next feed (0=none) */
 
 #ifdef USE_GPU
     /* GPU acceleration */
@@ -751,12 +752,17 @@ void burst_detector_feed(burst_detector_t *d, const int8_t *iq,
      * We maintain a residual buffer for partial FFT frames.
      */
 
-    /* Track timestamp */
+    /* Track timestamp: prefer hardware timestamp from SDR if available */
     if (d->start_time_ns == 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        if (d->pending_hw_ts != 0) {
+            d->start_time_ns = d->pending_hw_ts;
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        }
     }
+    d->pending_hw_ts = 0;
 
     /* Convert int8 to float complex and write to ringbuffer */
 
@@ -845,12 +851,17 @@ void burst_detector_feed(burst_detector_t *d, const int8_t *iq,
 
 void burst_detector_feed_cf32(burst_detector_t *d, const float *iq,
                               size_t num_samples, burst_callback_t cb, void *user) {
-    /* Track timestamp */
+    /* Track timestamp: prefer hardware timestamp from SDR if available */
     if (d->start_time_ns == 0) {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        if (d->pending_hw_ts != 0) {
+            d->start_time_ns = d->pending_hw_ts;
+        } else {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        }
     }
+    d->pending_hw_ts = 0;
 
     /* Convert interleaved float pairs to float complex and write to ringbuffer */
     if (num_samples > d->convert_buf_size) {
@@ -945,6 +956,10 @@ void *burst_detector_thread(void *arg) {
         sample_buf_t *samples;
         if (blocking_queue_take(&samples_queue, &samples) != 0)
             break;
+
+        /* Pass hardware timestamp to detector (used on first buffer only) */
+        if (samples->hw_timestamp_ns != 0)
+            det->pending_hw_ts = samples->hw_timestamp_ns;
 
         if (samples->format == SAMPLE_FMT_FLOAT)
             burst_detector_feed_cf32(det, (const float *)samples->samples,

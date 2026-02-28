@@ -708,6 +708,8 @@ SDR options:
     -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)
     -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)
     -B, --bias-tee          enable bias tee power
+    --clock-source=SRC      clock reference: internal (default), external, gpsdo
+    --time-source=SRC       time/PPS reference: internal (default), external, gpsdo
 
 Gain options:
     --hackrf-lna=GAIN       HackRF LNA gain in dB (default: 40)
@@ -780,6 +782,34 @@ Any SDR that tunes to L-band (1616-1626.5 MHz) and samples at 2 MHz or above wil
 | BladeRF | 12-bit | 40 MHz | Good sensitivity |
 | RTL-SDR (via SoapySDR) | 8-bit | 2.4 MHz | Limited bandwidth, but works |
 | Airspy, LimeSDR, etc. | varies | varies | Via SoapySDR |
+
+## Clock and Time Source
+
+For improved Doppler positioning accuracy, SDRs with external reference inputs can be configured to use a disciplined clock and/or GPS-synchronized timestamps.
+
+```bash
+# USRP with Ettus GPSDO module (disciplined 10 MHz + GPS time)
+./iridium-sniffer -i usrp-B210-SERIAL --clock-source gpsdo --time-source gpsdo --position
+
+# USRP with external GPSDO feeding 10 MHz REF IN + PPS IN
+./iridium-sniffer -i usrp-B210-SERIAL --clock-source external --time-source external --position
+
+# bladeRF with external 10 MHz reference (disciplines onboard VCTCXO)
+./iridium-sniffer -i bladerf0 --clock-source external
+
+# bladeRF with 1 PPS reference (GPSDO mode)
+./iridium-sniffer -i bladerf0 --clock-source gpsdo
+```
+
+| Source | USRP | bladeRF | SoapySDR |
+|--------|------|---------|----------|
+| `internal` (default) | Onboard oscillator | Onboard VCTCXO | Device default |
+| `external` | 10 MHz REF IN SMA | VCTCXO tamer (10 MHz) | `setClockSource("external")` |
+| `gpsdo` | Ettus GPSDO module | VCTCXO tamer (1 PPS) | `setClockSource("gpsdo")` |
+
+When `--time-source` is set to `external` or `gpsdo`, hardware timestamps from the SDR are used for burst timing instead of the host system clock. This eliminates OS scheduling jitter and clock drift, providing sub-microsecond burst arrival times for Doppler positioning.
+
+When no clock/time source is specified, behavior is identical to previous versions -- no extra API calls are made.
 
 ## GPU Acceleration
 
