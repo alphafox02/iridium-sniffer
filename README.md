@@ -245,10 +245,29 @@ Then open `http://localhost:8888` in a browser.
 
 The map shows:
 
-- **Active satellite count** and IRA/IBC frame totals in a status bar.
+- **Beam footprints** -- ground-level Iridium beam centers from IRA frames, colored per satellite.
+- **MT positions** -- mobile terminal (handset/IoT device) locations extracted from paging messages.
+- **Aircraft positions** -- rough location estimates from ACARS messages (see below).
+- **Paging events** -- beam positions where subscriber paging was detected.
+- **Receiver position** -- estimated location from the Doppler solver (when `--position` is active).
+- **Active satellite count** and frame totals in the status bar.
 - **Auto-centering** on the first received position, then free pan/zoom.
 
+All layers are individually toggleable via the layer control panel.
+
 Data updates once per second via Server-Sent Events. The map uses Leaflet.js with OpenStreetMap tiles, loaded from CDN. No files need to be installed or served separately.
+
+### Aircraft Position Layer
+
+When `--web` and `--acars` are used together, decoded ACARS messages are correlated with the most recent IRA ground beam position to estimate the transmitting aircraft's location:
+
+```bash
+./iridium-sniffer -i soapy-0 --web --acars
+```
+
+Each aircraft (identified by tail number) gets a colored dot at its latest beam-center fix and a dashed track line connecting successive fixes. Clicking a marker shows the registration, flight number (if present in the message), satellite/beam that carried the message, and the time of the last decoded message.
+
+**Accuracy note:** Position accuracy is approximately 150-200 km -- the radius of an Iridium beam footprint. This is sufficient to identify which region or ocean an aircraft is crossing, but not precise tracking. The track line connects beam-center positions and may show jumps when consecutive messages arrive via different satellites.
 
 **API endpoints:**
 
