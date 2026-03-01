@@ -47,4 +47,14 @@ void mtpos_ida_cb(const uint8_t *data, int len, uint64_t timestamp,
                    double frequency, ir_direction_t direction,
                    float magnitude, void *user);
 
+/* Add a beam-based aircraft position fix from an ACARS message.
+ * reg: aircraft registration (tail number, no leading dots).
+ * flight: flight number or empty string if unknown.
+ * lat/lon: beam center from the IRA ground beam that carried the message.
+ * Thread-safe. */
+void web_map_add_aircraft(const char *reg, const char *flight,
+                           double lat, double lon,
+                           int sat_id, int beam_id,
+                           uint64_t timestamp_ns, double frequency);
+
 #endif

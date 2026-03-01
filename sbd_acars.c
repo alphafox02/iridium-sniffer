@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "sbd_acars.h"
+#include "web_map.h"
 
 #ifdef HAVE_LIBACARS
 #include <libacars/libacars.h>
@@ -40,7 +41,14 @@
 
 int acars_json = 0;
 extern int acars_enabled;
+extern int web_enabled;
 static const char *station = NULL;
+
+/* Beam cache lookup from main.c -- provides approximate aircraft position
+ * by correlating the ACARS message timestamp with the most recent IRA ground
+ * beam position.  Returns 1 on success, 0 if no match within 10 seconds. */
+extern int beam_cache_lookup(uint64_t ts_ns, double *lat, double *lon,
+                              int *sat_id, int *beam_id);
 
 /* ---- UDP JSON streaming (up to 4 endpoints) ---- */
 
@@ -597,6 +605,22 @@ static void acars_parse_libacars(const uint8_t *data, int len, int ul,
                        ir_hdr, ir_hdr_len);
     }
 
+    /* Aircraft beam-based position (requires --web) */
+    if (web_enabled && !msg->err && msg->reg[0]) {
+        double bc_lat, bc_lon;
+        int bc_sat, bc_beam;
+        if (beam_cache_lookup(timestamp, &bc_lat, &bc_lon, &bc_sat, &bc_beam)) {
+            /* Strip leading dots from registration */
+            const char *tail = msg->reg;
+            while (*tail == '.') tail++;
+            if (*tail)
+                web_map_add_aircraft(tail,
+                                     msg->flight_id[0] ? msg->flight_id : "",
+                                     bc_lat, bc_lon, bc_sat, bc_beam,
+                                     timestamp, frequency);
+        }
+    }
+
     la_proto_tree_destroy(tree);
 }
 
@@ -992,6 +1016,28 @@ static void acars_parse_fallback(const uint8_t *data, int len, int ul,
                        ul, txt, txt_len, flight, msg_num, msg_num_seq,
                        errors, timestamp, frequency, magnitude,
                        hdr, hdr_len);
+    }
+
+    /* Aircraft beam-based position (requires --web, no errors) */
+    if (web_enabled && errors == 0 && len >= 8) {
+        /* Extract and strip leading dots from registration */
+        char reg_f[8] = {0};
+        int rstart = 1;
+        while (rstart < 8 && stripped[rstart] == '.')
+            rstart++;
+        int rlen = 8 - rstart;
+        if (rlen > 0) {
+            memcpy(reg_f, stripped + rstart, rlen);
+            reg_f[rlen] = '\0';
+        }
+        if (reg_f[0]) {
+            double bc_lat, bc_lon;
+            int bc_sat, bc_beam;
+            if (beam_cache_lookup(timestamp, &bc_lat, &bc_lon,
+                                  &bc_sat, &bc_beam))
+                web_map_add_aircraft(reg_f, "", bc_lat, bc_lon,
+                                     bc_sat, bc_beam, timestamp, frequency);
+        }
     }
 }
 

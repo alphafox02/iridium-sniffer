@@ -164,6 +164,46 @@ int zmq_enabled = 0;
 char *zmq_endpoint = NULL;
 #define ZMQ_DEFAULT_ENDPOINT "tcp://*:7006"
 
+/* ---- Beam cache for ACARS aircraft position correlation ---- */
+/* Stores recent IRA ground beam positions (alt < 100) so the ACARS
+ * callback can correlate a received message with the beam it arrived on. */
+
+#define BEAM_CACHE_SIZE 64
+
+typedef struct {
+    double lat, lon;
+    int sat_id, beam_id;
+    uint64_t timestamp_ns;  /* 0 = empty slot */
+} beam_cache_t;
+
+static beam_cache_t beam_cache[BEAM_CACHE_SIZE];
+static int beam_cache_head = 0;
+static pthread_mutex_t beam_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Look up the most recent ground beam position within 10 s before ts_ns.
+ * Returns 1 and fills out-params on success, 0 if no match found. */
+int beam_cache_lookup(uint64_t ts_ns, double *lat, double *lon,
+                      int *sat_id, int *beam_id)
+{
+    int found = 0;
+    pthread_mutex_lock(&beam_cache_lock);
+    for (int i = 0; i < BEAM_CACHE_SIZE; i++) {
+        int idx = (beam_cache_head - 1 - i + BEAM_CACHE_SIZE) % BEAM_CACHE_SIZE;
+        beam_cache_t *e = &beam_cache[idx];
+        if (e->timestamp_ns == 0) break;           /* empty -- stop */
+        if (e->timestamp_ns > ts_ns) continue;    /* future entry */
+        if (ts_ns - e->timestamp_ns > 10000000000ULL) break; /* > 10 s */
+        *lat    = e->lat;
+        *lon    = e->lon;
+        *sat_id = e->sat_id;
+        *beam_id = e->beam_id;
+        found = 1;
+        break;
+    }
+    pthread_mutex_unlock(&beam_cache_lock);
+    return found;
+}
+
 /* Threading state */
 volatile sig_atomic_t running = 1;
 pid_t self_pid;
@@ -334,9 +374,24 @@ static void *frame_consumer_thread(void *arg) {
                 decoded_frame_t decoded;
                 if (frame_decode(demod, &decoded)) {
                     if (decoded.type == FRAME_IRA) {
-                        if (web_enabled)
+                        if (web_enabled) {
                             web_map_add_ra(&decoded.ira, decoded.timestamp,
                                             decoded.frequency);
+                            /* Cache ground beam positions for ACARS aircraft correlation */
+                            if (decoded.ira.alt >= 0 && decoded.ira.alt < 100) {
+                                pthread_mutex_lock(&beam_cache_lock);
+                                beam_cache[beam_cache_head % BEAM_CACHE_SIZE] =
+                                    (beam_cache_t){
+                                        .lat = decoded.ira.lat,
+                                        .lon = decoded.ira.lon,
+                                        .sat_id = decoded.ira.sat_id,
+                                        .beam_id = decoded.ira.beam_id,
+                                        .timestamp_ns = decoded.timestamp
+                                    };
+                                beam_cache_head++;
+                                pthread_mutex_unlock(&beam_cache_lock);
+                            }
+                        }
                         if (position_enabled)
                             doppler_pos_add_measurement(&decoded.ira,
                                                          decoded.frequency,
