@@ -39,6 +39,9 @@
 #ifdef HAVE_SDRPLAY
 #include "sdrplay.h"
 #endif
+#ifdef HAVE_SIDEKIQ
+#include "sidekiq.h"
+#endif
 
 #include "sdr.h"
 #include "iridium.h"
@@ -130,6 +133,9 @@ int soapy_gain_elem_count = 0;
 #ifdef HAVE_SDRPLAY
 char *sdrplay_serial = NULL;
 #endif
+#ifdef HAVE_SIDEKIQ
+char *sidekiq_dev = NULL;
+#endif
 
 /* Per-SDR gain settings (defaults from gr-iridium example configs) */
 int hackrf_lna_gain = 40;
@@ -139,6 +145,7 @@ int bladerf_gain_val = 40;
 int usrp_gain_val = 40;
 double soapy_gain_val = 30.0;
 int sdrplay_gain_val = -1;  /* -1 = AGC (default), 0-59 = manual */
+int sidekiq_gain_val = 50;  /* hardware gain index (not dB), 0..~76 */
 int bias_tee = 0;
 int web_enabled = 0;
 int web_port = 8888;
@@ -839,6 +846,10 @@ int main(int argc, char **argv) {
     void *sdrplay_ctx = NULL;
     pthread_t sdrplay_thread;
 #endif
+#ifdef HAVE_SIDEKIQ
+    void *sidekiq_ctx = NULL;
+    pthread_t sidekiq_thread;
+#endif
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
@@ -1104,6 +1115,13 @@ int main(int argc, char **argv) {
             sdr_started = 1;
         }
 #endif
+#ifdef HAVE_SIDEKIQ
+        if (!sdr_started && sidekiq_dev) {
+            sidekiq_ctx = sidekiq_setup(sidekiq_dev);
+            pthread_create(&sidekiq_thread, NULL, sidekiq_stream_thread, sidekiq_ctx);
+            sdr_started = 1;
+        }
+#endif
 #ifdef HAVE_HACKRF
         if (!sdr_started && serial != NULL) {
             hackrf = hackrf_setup();
@@ -1174,6 +1192,12 @@ int main(int argc, char **argv) {
         if (sdrplay_ctx != NULL) {
             pthread_join(sdrplay_thread, NULL);
             sdrplay_close(sdrplay_ctx);
+        }
+#endif
+#ifdef HAVE_SIDEKIQ
+        if (sidekiq_ctx != NULL) {
+            pthread_join(sidekiq_thread, NULL);
+            sidekiq_close(sidekiq_ctx);
         }
 #endif
     }

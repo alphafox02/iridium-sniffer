@@ -37,6 +37,9 @@
 #ifdef HAVE_SDRPLAY
 #include "sdrplay.h"
 #endif
+#ifdef HAVE_SIDEKIQ
+#include "sidekiq.h"
+#endif
 
 typedef enum {
     FMT_CI8 = 0,
@@ -75,6 +78,9 @@ extern int soapy_gain_elem_count;
 #ifdef HAVE_SDRPLAY
 extern char *sdrplay_serial;
 #endif
+#ifdef HAVE_SIDEKIQ
+extern char *sidekiq_dev;
+#endif
 
 extern int hackrf_lna_gain;
 extern int hackrf_vga_gain;
@@ -83,6 +89,7 @@ extern int bladerf_gain_val;
 extern int usrp_gain_val;
 extern double soapy_gain_val;
 extern int sdrplay_gain_val;
+extern int sidekiq_gain_val;
 extern int bias_tee;
 extern int use_gpu;
 extern int simd_mode;
@@ -144,6 +151,7 @@ static void usage(int exitcode) {
 "                             soapy-N (by index) or soapy:driver=X,serial=Y (by args)\n"
 "                             hackrf-SERIAL, bladerfN, usrp-PRODUCT-SERIAL\n"
 "                             sdrplay-SERIAL (native SDRplay API)\n"
+"                             sidekiq or sidekiq-SERIAL (Epiq Sidekiq)\n"
 "    -c, --center-freq=HZ    center frequency in Hz (default: 1622000000)\n"
 "    -r, --sample-rate=HZ    sample rate in Hz (default: 10000000)\n"
 "    -B, --bias-tee           enable bias tee power\n"
@@ -158,6 +166,7 @@ static void usage(int exitcode) {
 "    --usrp-gain=GAIN        USRP gain in dB (default: 40)\n"
 "    --soapy-gain=GAIN       SoapySDR gain in dB (default: 30)\n"
 "    --sdrplay-gain=GAIN    SDRplay IF gain reduction 20-59, disables AGC (default: AGC on)\n"
+"    --sidekiq-gain=INDEX    Sidekiq RX gain index 0..~76, not dB (default: 50)\n"
 "    --soapy-gain-element=NAME:VAL  set SoapySDR per-element gain (repeatable)\n"
 "                             e.g. LNA:10, MIX:9, VGA:10 (Airspy R2)\n"
 "                             skips aggregate --soapy-gain when any element is set\n"
@@ -246,6 +255,9 @@ static void list_interfaces(void) {
 #ifdef HAVE_SDRPLAY
     sdrplay_list();
 #endif
+#ifdef HAVE_SIDEKIQ
+    sidekiq_list();
+#endif
 #ifdef HAVE_SOAPYSDR
     soapy_list();
 #endif
@@ -294,6 +306,7 @@ void parse_options(int argc, char **argv) {
         OPT_CLOCK_SOURCE,
         OPT_TIME_SOURCE,
         OPT_SDRPLAY_GAIN,
+        OPT_SIDEKIQ_GAIN,
         OPT_VITA49,
         OPT_BASESTATION,
         OPT_BASESTATION_BEAM,
@@ -346,6 +359,7 @@ void parse_options(int argc, char **argv) {
         { "clock-source",   required_argument, NULL, OPT_CLOCK_SOURCE },
         { "time-source",    required_argument, NULL, OPT_TIME_SOURCE },
         { "sdrplay-gain",   required_argument, NULL, OPT_SDRPLAY_GAIN },
+        { "sidekiq-gain",   required_argument, NULL, OPT_SIDEKIQ_GAIN },
         { "vita49",         optional_argument, NULL, OPT_VITA49 },
         { "basestation",    optional_argument, NULL, OPT_BASESTATION },
         { "basestation-beam", no_argument,     NULL, OPT_BASESTATION_BEAM },
@@ -404,6 +418,12 @@ void parse_options(int argc, char **argv) {
                     break;
                 }
 #endif
+#ifdef HAVE_SIDEKIQ
+                if (strstr(optarg, "sidekiq") == optarg) {
+                    sidekiq_dev = strdup(optarg);
+                    break;
+                }
+#endif
                 errx(1, "Unknown SDR interface: %s", optarg);
                 break;
 
@@ -457,6 +477,7 @@ void parse_options(int argc, char **argv) {
             case OPT_USRP_GAIN:   usrp_gain_val    = atoi(optarg); break;
             case OPT_SOAPY_GAIN:  soapy_gain_val   = atof(optarg); break;
             case OPT_SDRPLAY_GAIN: sdrplay_gain_val = atoi(optarg); break;
+            case OPT_SIDEKIQ_GAIN: sidekiq_gain_val = atoi(optarg); break;
             case OPT_NO_GPU:      use_gpu = 0;                       break;
             case OPT_NO_SIMD:     simd_mode = SIMD_SCALAR;           break;
             case OPT_SIMD:

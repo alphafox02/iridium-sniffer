@@ -53,6 +53,7 @@ find_package(BladeRF)
 find_package(UHD)
 find_package(SoapySDR)
 find_package(SDRplay)
+find_package(Sidekiq)
 
 # Normalize found variables (FindHackRF has a bug where LIBHACKRF_FOUND isn't set)
 if(LIBHACKRF_LIBRARY AND LIBHACKRF_INCLUDE_DIR)
@@ -62,13 +63,13 @@ if(LIBHACKRF_LIBRARY AND LIBHACKRF_INCLUDE_DIR)
 endif()
 
 set(HAVE_ANY_SDR FALSE)
-if(LIBHACKRF_FOUND OR LIBBLADERF_FOUND OR UHD_FOUND OR SOAPYSDR_FOUND OR SDRPLAY_FOUND)
+if(LIBHACKRF_FOUND OR LIBBLADERF_FOUND OR UHD_FOUND OR SOAPYSDR_FOUND OR SDRPLAY_FOUND OR SIDEKIQ_FOUND)
     set(HAVE_ANY_SDR TRUE)
 endif()
 
 if(NOT HAVE_ANY_SDR)
     message(WARNING "No SDR backend found. Live capture will not be available.\n"
-                    "Install at least one of: libhackrf, libbladeRF, UHD, SoapySDR, SDRplay API")
+                    "Install at least one of: libhackrf, libbladeRF, UHD, SoapySDR, SDRplay API, Sidekiq SDK")
 endif()
 
 # Optional ZMQ for multi-consumer PUB/SUB output (iridium-toolkit compatible)
@@ -205,6 +206,10 @@ if(SDRPLAY_FOUND)
     list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/sdrplay.c)
     include_directories(${SDRPLAY_INCLUDE_DIR})
 endif()
+if(SIDEKIQ_FOUND)
+    list(APPEND SOURCES ${PROJECT_SOURCE_DIR}/sidekiq.c)
+    include_directories(${SIDEKIQ_INCLUDE_DIR})
+endif()
 
 add_executable(iridium-sniffer ${SOURCES})
 
@@ -241,6 +246,11 @@ if(SDRPLAY_FOUND)
     target_link_libraries(iridium-sniffer PRIVATE ${SDRPLAY_LIBRARIES})
     target_compile_definitions(iridium-sniffer PRIVATE HAVE_SDRPLAY)
     message(STATUS "SDRplay: enabled (native API)")
+endif()
+if(SIDEKIQ_FOUND)
+    target_link_libraries(iridium-sniffer PRIVATE ${SIDEKIQ_LIBRARIES})
+    target_compile_definitions(iridium-sniffer PRIVATE HAVE_SIDEKIQ)
+    message(STATUS "Sidekiq: enabled (native libsidekiq)")
 endif()
 
 # libacars ARINC-622 decoding
