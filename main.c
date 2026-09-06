@@ -278,6 +278,9 @@ atomic_ulong stat_n_dropped = 0;
 atomic_ulong stat_n_frame_drops = 0;
 atomic_ulong stat_n_output_drops = 0;
 atomic_ulong stat_sample_count = 0;
+/* Samples discarded because the detector queue was full. Counted in samples,
+ * not buffers, so it can be compared directly against stat_sample_count. */
+atomic_ulong stat_n_sample_drops = 0;
 
 /* Global detector pointer for diagnostic stats (set by detector thread) */
 burst_detector_t *global_detector = NULL;
@@ -292,6 +295,7 @@ void parse_options(int argc, char **argv);
 void push_samples(sample_buf_t *buf) {
     atomic_fetch_add(&stat_sample_count, buf->num);
     if (blocking_queue_add(&samples_queue, buf) == BQ_FULL) {
+        atomic_fetch_add(&stat_n_sample_drops, buf->num);
         if (verbose)
             fprintf(stderr, "WARNING: dropped samples\n");
         free(buf);
@@ -665,7 +669,18 @@ static void *output_thread_fn(void *arg) {
  *   o: N/s | ok: N% | ok: N/s | ok_avg: N% | ok: TOTAL | ok_avg: N/s | d: N
  *
  * In offline (file) mode, "i: N/s" is replaced with "srr: N%" (sample rate ratio).
+ *
+ * "d: N" counts detected bursts that could not be queued for downmixing. It is
+ * not a sample-drop counter. Sample loss appears as "sl: N%", the share of the
+ * expected sample stream that never reached the decoder.
  */
+
+/* Sample-loss thresholds: settle time before the baseline is taken, loss
+ * percentage that triggers the one-shot warning, and how long the loss must
+ * persist past the baseline before warning. */
+#define LOSS_SETTLE_S      5.0
+#define LOSS_WARN_PCT      2.0
+#define LOSS_WARN_AFTER_S  30.0
 
 static void *stats_thread_fn(void *arg) {
     (void)arg;
@@ -674,6 +689,15 @@ static void *stats_thread_fn(void *arg) {
     unsigned long prev_det = 0, prev_ok = 0, prev_sub = 0;
     unsigned long prev_handled = 0, prev_samples = 0;
     unsigned q_max = 0;
+
+    /* Sample-loss detection. Burst timestamps are derived from the SDR sample
+     * counter, so any sample the host never receives shifts every later
+     * timestamp behind wall clock and never recovers. Some drivers (notably
+     * SoapyPlutoSDR) never surface an overflow, so comparing received samples
+     * against elapsed time is the only way to see the loss. The baseline is
+     * taken after the stream settles so activation latency is not counted. */
+    unsigned long loss_base_t = 0, loss_base_samp = 0, loss_base_drops = 0;
+    int loss_warned = 0;
 
     while (running) {
         usleep(1000000);
@@ -691,6 +715,43 @@ static void *stats_thread_fn(void *arg) {
         unsigned long sub     = atomic_load(&stat_n_ok_sub);
         unsigned long dropped = atomic_load(&stat_n_dropped);
         unsigned long samp    = atomic_load(&stat_sample_count);
+
+        /* Fraction of the expected sample stream that never arrived */
+        double loss_pct = 0;
+        unsigned long sdrop = atomic_load(&stat_n_sample_drops);
+        /* Applies to any real-time source (SDR, ZMQ, VITA-49), but not to
+         * file replay, which legitimately runs faster or slower than realtime
+         * and reports that as srr instead. */
+        if (in_file == NULL && samp_rate > 0) {
+            if (loss_base_t == 0) {
+                if (elapsed >= LOSS_SETTLE_S) {
+                    loss_base_t = now;
+                    loss_base_samp = samp;
+                    loss_base_drops = sdrop;
+                }
+            } else {
+                double span = (now - loss_base_t) / 1000.0;
+                double expected = samp_rate * span;
+                if (expected > 0) {
+                    /* Samples the detector actually saw: those the driver
+                     * delivered, minus those dropped at a full queue. */
+                    double seen = (double)(samp - loss_base_samp)
+                                  - (double)(sdrop - loss_base_drops);
+                    loss_pct = 100.0 * (1.0 - seen / expected);
+                    if (loss_pct < 0) loss_pct = 0;
+                    if (loss_pct >= LOSS_WARN_PCT && !loss_warned
+                        && span >= LOSS_WARN_AFTER_S) {
+                        loss_warned = 1;
+                        fprintf(stderr,
+                                "WARNING: %.0f%% of samples are not reaching the "
+                                "decoder. The SDR link cannot sustain %.3f Msps. "
+                                "Burst timestamps will drift behind wall clock. "
+                                "Lower --sample-rate or increase driver buffering.\n",
+                                loss_pct, samp_rate / 1e6);
+                    }
+                }
+            }
+        }
 
         /* Per-interval deltas */
         unsigned long dd    = det     - prev_det;
@@ -741,7 +802,10 @@ static void *stats_thread_fn(void *arg) {
                            noise_floor, peak_signal);
 
             /* Simple status guidance */
-            if (det == 0 && elapsed > 120) {
+            if (loss_pct >= LOSS_WARN_PCT) {
+                fprintf(stderr, "| Losing %.0f%% of samples - lower sample rate",
+                        loss_pct);
+            } else if (det == 0 && elapsed > 120) {
                 fprintf(stderr, "| No bursts detected - check antenna");
             } else if (ok_avg_pct >= 70 && burst_per_min >= 3) {
                 fprintf(stderr, "| Setup looks good (gap: %.1f dB)", signal_gap);
@@ -771,6 +835,8 @@ static void *stats_thread_fn(void *arg) {
             fprintf(stderr, " | ok: %10lu", sub);
             fprintf(stderr, " | ok_avg: %3.0f/s", ok_rate_avg);
             fprintf(stderr, " | d: %lu", dropped);
+            if (loss_pct >= 1.0)
+                fprintf(stderr, " | sl: %.0f%%", loss_pct);
             {
                 unsigned long fd = atomic_load(&stat_n_frame_drops);
                 unsigned long od = atomic_load(&stat_n_output_drops);
