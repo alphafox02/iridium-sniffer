@@ -729,7 +729,27 @@ Then specify the interface with `-i`. SoapySDR devices can be selected by index 
 # SoapySDR device-specific settings
 ./iridium-sniffer -i soapy:driver=airspy,serial=ABC --soapy-setting=bitpack:true
 ./iridium-sniffer -i soapy:driver=bladerf --soapy-setting=biastee_rx:true
+
+# LibreSDR / PlutoSDR running Tezuka firmware: put 8-bit samples on the wire
+./iridium-sniffer -i soapy-0 --soapy-device-arg=tezuka_format:CS8
 ```
+
+SoapySDR exposes three separate knobs and they are not interchangeable. A value
+set through the wrong one is accepted and then ignored, which looks like the
+option had no effect:
+
+| Option | Applied at | Typical use |
+|---|---|---|
+| `--soapy-device-arg=K:V` | device open | driver modes fixed at open time |
+| `--soapy-stream-arg=K:V` | `setupStream` | buffer sizing (`bufflen`) |
+| `--soapy-setting=K:V` | `writeSetting` | runtime toggles (bias tee, bitpack) |
+
+**Tezuka PlutoSDR firmware:** requesting CS8 alone is not enough. Without
+`--soapy-device-arg=tezuka_format:CS8` the fork converts to 8-bit on the host
+and still moves 16-bit I and Q across the link, so 10 Msps costs 40 MB/s
+instead of 20 MB/s. On a USB-attached LibreSDR that overruns the link and
+samples are lost silently. The log line distinguishes the two: `Using format
+CS8 Tezuka.` is the 8-bit wire mode, plain `Using format CS8.` is not.
 
 ### Piping to iridium-toolkit
 
@@ -872,8 +892,13 @@ Gain options:
                              e.g. LNA:10, MIX:9, VGA:10 (Airspy R2)
                              skips aggregate --soapy-gain when any element is set
                              use -v to list available gain elements for your device
-    --soapy-setting=K:V    SoapySDR device setting (repeatable)
+    --soapy-setting=K:V    SoapySDR device setting, via writeSetting (repeatable)
                              e.g. bitpack:true (Airspy), biastee_rx:true (bladeRF)
+    --soapy-device-arg=K:V SoapySDR device arg, applied when the device is
+                             opened (repeatable). Works with -i soapy-N too.
+                             e.g. tezuka_format:CS8 (Tezuka PlutoSDR firmware)
+    --soapy-stream-arg=K:V SoapySDR stream arg, applied at setupStream
+                             (repeatable). e.g. bufflen:262144 (PlutoSDR)
     --sdrplay-gain=GAIN    SDRplay IF gain reduction 20-59, disables AGC (default: AGC on)
 
 Detection:

@@ -30,6 +30,12 @@ extern int time_source;
 #define SOAPY_SETTINGS_MAX 8
 extern char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
 extern char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
+extern char *soapy_dev_arg_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_dev_arg_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_dev_arg_count;
+extern char *soapy_stream_arg_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_stream_arg_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_stream_arg_count;
 extern int soapy_setting_count;
 
 #define SOAPY_GAINS_MAX 8
@@ -82,14 +88,45 @@ void soapy_list(void) {
     SoapySDRKwargsList_clear(results, length);
 }
 
+/* Merge --soapy-device-arg values into the kwargs used to open the device.
+ * Applies in both index and args mode, so -i soapy-N can still reach driver
+ * modes that are only selectable at open time. */
+static void soapy_merge_device_args(SoapySDRKwargs *kw) {
+    for (int i = 0; i < soapy_dev_arg_count; ++i) {
+        SoapySDRKwargs_set(kw, soapy_dev_arg_keys[i], soapy_dev_arg_vals[i]);
+        if (verbose)
+            fprintf(stderr, "SoapySDR: device arg %s=%s\n",
+                    soapy_dev_arg_keys[i], soapy_dev_arg_vals[i]);
+    }
+}
+
+/* Build the kwargs for setupStream from --soapy-stream-arg. Returns an empty
+ * dict when none were given, which behaves the same as passing NULL. */
+static SoapySDRKwargs soapy_build_stream_args(void) {
+    SoapySDRKwargs kw;
+    memset(&kw, 0, sizeof(kw));
+    for (int i = 0; i < soapy_stream_arg_count; ++i) {
+        SoapySDRKwargs_set(&kw, soapy_stream_arg_keys[i], soapy_stream_arg_vals[i]);
+        if (verbose)
+            fprintf(stderr, "SoapySDR: stream arg %s=%s\n",
+                    soapy_stream_arg_keys[i], soapy_stream_arg_vals[i]);
+    }
+    return kw;
+}
+
+
 SoapySDRDevice *soapy_setup(int id, const char *args) {
     SoapySDRDevice *device;
     char **formats;
     size_t num_formats;
 
     if (args) {
-        /* Device args mode: pass directly to SoapySDR */
-        device = SoapySDRDevice_makeStrArgs(args);
+        /* Device args mode. Parsed into kwargs rather than passed as a string
+         * so --soapy-device-arg values can be merged in. */
+        SoapySDRKwargs kw = SoapySDRKwargs_fromString(args);
+        soapy_merge_device_args(&kw);
+        device = SoapySDRDevice_make(&kw);
+        SoapySDRKwargs_clear(&kw);
         if (device == NULL)
             errx(1, "Unable to open SoapySDR device with args '%s': %s",
                  args, SoapySDRDevice_lastError());
@@ -105,6 +142,7 @@ SoapySDRDevice *soapy_setup(int id, const char *args) {
             errx(1, "Invalid SoapySDR device index: %d (found %zu devices)", id, length);
         }
 
+        soapy_merge_device_args(&results[id]);
         device = SoapySDRDevice_make(&results[id]);
         SoapySDRKwargsList_clear(results, length);
 
@@ -298,10 +336,14 @@ void *soapy_stream_thread(void *arg) {
     const char *format;
     size_t mtu;
 
+    /* Stream args from --soapy-stream-arg. Buffer sizing (PlutoSDR bufflen,
+     * for instance) is only reachable here, not through writeSetting. */
+    SoapySDRKwargs stream_args = soapy_build_stream_args();
+
     if (sample_mode == 0) {
         format = SOAPY_SDR_CS8;
         stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
+                                             &channel, 1, &stream_args);
         if (stream == NULL) {
             if (verbose)
                 warnx("CS8 stream failed, trying CF32");
@@ -314,7 +356,7 @@ void *soapy_stream_thread(void *arg) {
     if (stream == NULL && sample_mode == 1) {
         format = SOAPY_SDR_CF32;
         stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
+                                             &channel, 1, &stream_args);
         if (stream == NULL) {
             if (verbose)
                 warnx("CF32 stream failed, falling back to CS16");
@@ -325,7 +367,7 @@ void *soapy_stream_thread(void *arg) {
     if (stream == NULL) {
         format = SOAPY_SDR_CS16;
         stream = SoapySDRDevice_setupStream(device, SOAPY_SDR_RX, format,
-                                             &channel, 1, NULL);
+                                             &channel, 1, &stream_args);
         if (stream == NULL)
             errx(1, "Unable to setup SoapySDR stream: %s", SoapySDRDevice_lastError());
     }
@@ -413,6 +455,7 @@ void *soapy_stream_thread(void *arg) {
     }
 
     free(cs16_buf);
+    SoapySDRKwargs_clear(&stream_args);
 
     SoapySDRDevice_deactivateStream(device, stream, 0, 0);
     SoapySDRDevice_closeStream(device, stream);

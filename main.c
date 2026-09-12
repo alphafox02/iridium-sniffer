@@ -124,6 +124,19 @@ char *soapy_args = NULL;
 char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
 char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
 int soapy_setting_count = 0;
+/* Device args, merged into the kwargs handed to SoapySDRDevice_make. Some
+ * drivers only expose a mode this way, not through writeSetting: the Tezuka
+ * PlutoSDR firmware needs tezuka_format=CS8 to put 8-bit samples on the wire
+ * instead of converting on the host. */
+char *soapy_dev_arg_keys[SOAPY_SETTINGS_MAX];
+char *soapy_dev_arg_vals[SOAPY_SETTINGS_MAX];
+int soapy_dev_arg_count = 0;
+/* Stream args, handed to setupStream. Buffer sizing lives here (bufflen),
+ * not in writeSetting, which is why setting it as a device setting is
+ * accepted and then silently ignored. */
+char *soapy_stream_arg_keys[SOAPY_SETTINGS_MAX];
+char *soapy_stream_arg_vals[SOAPY_SETTINGS_MAX];
+int soapy_stream_arg_count = 0;
 #define SOAPY_GAINS_MAX 8
 char *soapy_gain_elem_names[SOAPY_GAINS_MAX];
 double soapy_gain_elem_vals[SOAPY_GAINS_MAX];

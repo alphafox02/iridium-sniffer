@@ -69,6 +69,12 @@ extern char *soapy_args;
 #define SOAPY_SETTINGS_MAX 8
 extern char *soapy_setting_keys[SOAPY_SETTINGS_MAX];
 extern char *soapy_setting_vals[SOAPY_SETTINGS_MAX];
+extern char *soapy_dev_arg_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_dev_arg_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_dev_arg_count;
+extern char *soapy_stream_arg_keys[SOAPY_SETTINGS_MAX];
+extern char *soapy_stream_arg_vals[SOAPY_SETTINGS_MAX];
+extern int soapy_stream_arg_count;
 extern int soapy_setting_count;
 #define SOAPY_GAINS_MAX 8
 extern char *soapy_gain_elem_names[SOAPY_GAINS_MAX];
@@ -170,7 +176,13 @@ static void usage(int exitcode) {
 "                             e.g. LNA:10, MIX:9, VGA:10 (Airspy R2)\n"
 "                             skips aggregate --soapy-gain when any element is set\n"
 "                             use -v to list available gain elements for your device\n"
-"    --soapy-setting=K:V    SoapySDR device setting (repeatable)\n"
+"    --soapy-setting=K:V    SoapySDR device setting, via writeSetting (repeatable)\n"
+"    --soapy-device-arg=K:V SoapySDR device arg, applied when the device is\n"
+"                             opened (repeatable). Works with -i soapy-N too.\n"
+"                             Tezuka PlutoSDR: tezuka_format=CS8 for 8-bit\n"
+"                             samples on the wire (halves link bandwidth)\n"
+"    --soapy-stream-arg=K:V SoapySDR stream arg, applied at setupStream\n"
+"                             (repeatable). PlutoSDR buffer sizing: bufflen=N\n"
 "                             e.g. bitpack:true (Airspy), biastee_rx:true (bladeRF)\n"
 "\n"
 "Detection options:\n"
@@ -298,6 +310,8 @@ void parse_options(int argc, char **argv) {
         OPT_FEED,
         OPT_STATION,
         OPT_SOAPY_SETTING,
+        OPT_SOAPY_DEV_ARG,
+        OPT_SOAPY_STREAM_ARG,
         OPT_SOAPY_GAIN_ELEM,
         OPT_ZMQ,
         OPT_ZMQ_SUB,
@@ -350,6 +364,8 @@ void parse_options(int argc, char **argv) {
         { "feed",           optional_argument, NULL, OPT_FEED },
         { "station",        required_argument, NULL, OPT_STATION },
         { "soapy-setting",  required_argument, NULL, OPT_SOAPY_SETTING },
+        { "soapy-device-arg", required_argument, NULL, OPT_SOAPY_DEV_ARG },
+        { "soapy-stream-arg", required_argument, NULL, OPT_SOAPY_STREAM_ARG },
         { "soapy-gain-element", required_argument, NULL, OPT_SOAPY_GAIN_ELEM },
         { "zmq",            optional_argument, NULL, OPT_ZMQ },
         { "zmq-sub",        optional_argument, NULL, OPT_ZMQ_SUB },
@@ -694,6 +710,46 @@ void parse_options(int argc, char **argv) {
                 }
 #else
                 errx(1, "--soapy-setting requires SoapySDR support");
+#endif
+                break;
+
+            case OPT_SOAPY_DEV_ARG:
+#ifdef HAVE_SOAPYSDR
+                if (soapy_dev_arg_count >= SOAPY_SETTINGS_MAX)
+                    errx(1, "Too many --soapy-device-arg options (max %d)",
+                         SOAPY_SETTINGS_MAX);
+                {
+                    char *colon = strchr(optarg, ':');
+                    if (!colon)
+                        errx(1, "--soapy-device-arg requires KEY:VALUE "
+                             "(e.g. tezuka_format:CS8)");
+                    *colon = '\0';
+                    soapy_dev_arg_keys[soapy_dev_arg_count] = strdup(optarg);
+                    soapy_dev_arg_vals[soapy_dev_arg_count] = strdup(colon + 1);
+                    soapy_dev_arg_count++;
+                }
+#else
+                errx(1, "--soapy-device-arg requires SoapySDR support");
+#endif
+                break;
+
+            case OPT_SOAPY_STREAM_ARG:
+#ifdef HAVE_SOAPYSDR
+                if (soapy_stream_arg_count >= SOAPY_SETTINGS_MAX)
+                    errx(1, "Too many --soapy-stream-arg options (max %d)",
+                         SOAPY_SETTINGS_MAX);
+                {
+                    char *colon = strchr(optarg, ':');
+                    if (!colon)
+                        errx(1, "--soapy-stream-arg requires KEY:VALUE "
+                             "(e.g. bufflen:262144)");
+                    *colon = '\0';
+                    soapy_stream_arg_keys[soapy_stream_arg_count] = strdup(optarg);
+                    soapy_stream_arg_vals[soapy_stream_arg_count] = strdup(colon + 1);
+                    soapy_stream_arg_count++;
+                }
+#else
+                errx(1, "--soapy-stream-arg requires SoapySDR support");
 #endif
                 break;
 
