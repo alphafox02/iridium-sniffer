@@ -59,9 +59,13 @@ int voice_decode_total_calls(void);
 /* Get total number of VOC frames received. */
 int voice_decode_total_frames(void);
 
-/* Get a completed call by index (0 = oldest in buffer).
- * Returns NULL if index out of range. */
-const voice_call_t *voice_decode_get_call(int index);
+/* Copy a completed call's metadata by index (0 = oldest in buffer); audio is
+ * left NULL. Returns 0, or -1 if out of range. */
+int voice_decode_get_call(int index, voice_call_t *out);
+
+/* Copy a call's audio by call_id into a malloc'd buffer the caller frees.
+ * The ring can free the original at any time, so never hold a pointer to it. */
+int16_t *voice_decode_copy_audio(int call_id, int *n_samples);
 
 /* Get number of calls currently in the buffer. */
 int voice_decode_call_count(void);

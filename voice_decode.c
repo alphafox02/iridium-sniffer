@@ -315,19 +315,44 @@ int voice_decode_call_count(void)
     return n;
 }
 
-const voice_call_t *voice_decode_get_call(int index)
+int voice_decode_get_call(int index, voice_call_t *out)
 {
-    const voice_call_t *result = NULL;
+    int ret = -1;
     pthread_mutex_lock(&voice_lock);
 
     if (index >= 0 && index < call_count) {
         /* Index 0 = oldest, call_count-1 = newest */
         int pos = (call_head - call_count + index + VOICE_MAX_CALLS)
                   % VOICE_MAX_CALLS;
-        if (calls[pos].valid)
-            result = &calls[pos];
+        if (calls[pos].valid) {
+            *out = calls[pos];
+            out->audio = NULL;
+            ret = 0;
+        }
     }
 
     pthread_mutex_unlock(&voice_lock);
-    return result;
+    return ret;
+}
+
+int16_t *voice_decode_copy_audio(int call_id, int *n_samples)
+{
+    int16_t *copy = NULL;
+    *n_samples = 0;
+    pthread_mutex_lock(&voice_lock);
+
+    for (int i = 0; i < VOICE_MAX_CALLS; i++) {
+        voice_call_t *c = &calls[i];
+        if (!c->valid || c->call_id != call_id || !c->audio || c->n_samples <= 0)
+            continue;
+        copy = malloc(sizeof(int16_t) * c->n_samples);
+        if (copy) {
+            memcpy(copy, c->audio, sizeof(int16_t) * c->n_samples);
+            *n_samples = c->n_samples;
+        }
+        break;
+    }
+
+    pthread_mutex_unlock(&voice_lock);
+    return copy;
 }

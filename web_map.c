@@ -1564,46 +1564,34 @@ static void handle_client(int fd)
     } else if (voice_enabled && strcmp(path, "/api/calls") == 0) {
         /* Voice calls JSON list */
         int n_calls = voice_decode_call_count();
-        int bufsize = 256 + n_calls * 256;
-        char *json = malloc(bufsize);
-        if (json) {
-            int pos = 0;
-            pos += snprintf(json + pos, bufsize - pos,
-                "{\"total_calls\":%d,\"total_voc_frames\":%d,\"calls\":[",
-                voice_decode_total_calls(), voice_decode_total_frames());
-            for (int i = n_calls - 1; i >= 0 && pos < bufsize - 256; i--) {
-                const voice_call_t *c = voice_decode_get_call(i);
-                if (!c) continue;
-                int dur_ms = (int)((c->end_time - c->start_time) / 1000000ULL);
-                if (i < n_calls - 1) pos += snprintf(json + pos, bufsize - pos, ",");
-                pos += snprintf(json + pos, bufsize - pos,
-                    "{\"id\":%d,\"t\":%lu,\"dur\":%d,"
-                    "\"freq\":%.0f,\"frames\":%d,"
-                    "\"quality\":%d,\"samples\":%d}",
-                    c->call_id,
-                    (unsigned long)(c->start_time / 1000000000ULL),
-                    dur_ms, c->frequency, c->n_frames,
-                    (int)c->quality, c->n_samples);
-            }
-            pos += snprintf(json + pos, bufsize - pos, "]}");
-            send_response(fd, "200 OK", "application/json", json, pos);
-            free(json);
+        jbuf_t json = {0};
+        jb_printf(&json, "{\"total_calls\":%d,\"total_voc_frames\":%d,\"calls\":[",
+                  voice_decode_total_calls(), voice_decode_total_frames());
+        int n_emit = 0;
+        for (int i = n_calls - 1; i >= 0; i--) {
+            voice_call_t c;
+            if (voice_decode_get_call(i, &c) != 0) continue;
+            int dur_ms = (int)((c.end_time - c.start_time) / 1000000ULL);
+            jb_printf(&json, "%s{\"id\":%d,\"t\":%lu,\"dur\":%d,"
+                "\"freq\":%.0f,\"frames\":%d,\"quality\":%d,\"samples\":%d}",
+                n_emit++ ? "," : "", c.call_id,
+                (unsigned long)(c.start_time / 1000000000ULL),
+                dur_ms, c.frequency, c.n_frames, (int)c.quality, c.n_samples);
         }
+        jb_printf(&json, "]}");
+        if (!json.oom)
+            send_response(fd, "200 OK", "application/json", json.p, (int)json.len);
+        free(json.p);
         close(fd);
     } else if (voice_enabled && strncmp(path, "/api/calls/", 11) == 0) {
         /* Voice call audio: /api/calls/N/audio */
         int call_id = -1;
         if (sscanf(path + 11, "%d/audio", &call_id) == 1 && call_id >= 0) {
-            /* Find call by ID */
-            const voice_call_t *call = NULL;
-            int n_calls = voice_decode_call_count();
-            for (int i = 0; i < n_calls; i++) {
-                const voice_call_t *c = voice_decode_get_call(i);
-                if (c && c->call_id == call_id) { call = c; break; }
-            }
-            if (call && call->audio && call->n_samples > 0) {
+            int n_samples = 0;
+            int16_t *audio = voice_decode_copy_audio(call_id, &n_samples);
+            if (audio) {
                 /* Build WAV file in memory */
-                int data_size = call->n_samples * 2;
+                int data_size = n_samples * 2;
                 int wav_size = 44 + data_size;
                 uint8_t *wav = malloc(wav_size);
                 if (wav) {
@@ -1632,7 +1620,7 @@ static void handle_client(int fd)
                     memcpy(wav + 36, "data", 4);
                     uint32_t data_sz = data_size;
                     memcpy(wav + 40, &data_sz, 4);
-                    memcpy(wav + 44, call->audio, data_size);
+                    memcpy(wav + 44, audio, data_size);
 
                     send_response(fd, "200 OK", "audio/wav",
                                   (char *)wav, wav_size);
@@ -1641,6 +1629,7 @@ static void handle_client(int fd)
                     send_response(fd, "500 Internal Server Error",
                                   "text/plain", "OOM", 3);
                 }
+                free(audio);
             } else {
                 send_response(fd, "404 Not Found", "text/plain",
                               "call not found", 14);
