@@ -866,7 +866,10 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     /* Build output frame */
     downmix_frame_t *frame = malloc(sizeof(*frame));
     frame->id = burst->info.id;
-    frame->timestamp = timestamp + (uint64_t)((double)start / dm->output_sample_rate * 1e9);
+    /* Timestamp the first UW symbol, as gr-iridium and the toolkit's
+     * timing tools expect, not the start-finder position */
+    frame->timestamp = timestamp + (uint64_t)((start + uw_start + uw_start_correction)
+                                              / dm->output_sample_rate * 1e9);
     frame->center_frequency = center_frequency;
     frame->sample_rate = (float)dm->output_sample_rate;
     frame->samples_per_symbol = dm->samples_per_symbol;
