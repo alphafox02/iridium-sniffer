@@ -45,6 +45,11 @@
 #define BCH_RA_DATA   21     /* 31 - 10 = 21 data bits */
 #define BCH_HDR_DATA  3      /* 7 - 4 = 3 data bits */
 
+/* Simplex/duplex bounds as iridium-toolkit: channel edge, max Doppler,
+ * extractor jitter and 100 ppm SDR error */
+#define F_SIMPLEX_MIN ((1626104e3 - 36e3 - 1e3) * (1 - 100e-6))
+#define F_DUPLEX_MAX  ((1625979e3 + 36e3 + 1e3) * (1 + 100e-6))
+
 /* Chase decoder: flip up to N least-reliable bits, retry BCH */
 #define CHASE_FLIP_MAX 7     /* Max of 7 (127 combinations); stack array sized to that max. */
 extern int use_chase;        /* Chase flip-bits count comes from the --chase=N runtime option */
@@ -61,7 +66,6 @@ static const uint8_t access_ul[] = {
 /* poly=1207: 1024 entries (10-bit syndrome), each stores error locator XOR mask */
 static struct { int errs; uint32_t locator; } syn_ra[1024];
 /* poly=29: 16 entries (4-bit syndrome) */
-static struct { int errs; uint32_t locator; } syn_hdr[16];
 
 /* ---- GF(2) polynomial remainder (BCH syndrome) ---- */
 
@@ -133,7 +137,6 @@ static void build_syndrome_table(uint32_t poly, int nbits, int synbits,
 void frame_decode_init(void)
 {
     build_syndrome_table(BCH_POLY_RA, 31, 10, 2, syn_ra, 1024);
-    build_syndrome_table(BCH_POLY_HDR, 7, 4, 1, syn_hdr, 16);
 }
 
 int bch_31_21_correct(uint32_t syndrome, uint32_t *locator)
@@ -390,21 +393,24 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
     const float *data_llr = frame->llr ? frame->llr + 24 : NULL;
     int data_len = frame->n_bits - 24;
 
+    double freq = frame->center_frequency;
+
     /* ---- Try IBC detection ----
      * Header: 6 bits BCH(7,3), then 64-bit de-interleaved data blocks.
-     * Detection: BCH correction on header + first data blocks. */
-    if (data_len >= 6 + 64) {
-        /* Check IBC header (BCH(7,3) with error correction) */
-        uint32_t hdr_val = bits_to_uint(data, 6);
+     * Detection: BCH correction on header + first data blocks.
+     * Broadcast is downlink on the duplex channels. */
+    if (is_dl && freq < F_DUPLEX_MAX && data_len >= 6 + 64) {
+        /* The toolkit pair-swaps raw symbols before reading the header;
+         * de_interleave folds that swap in, a direct read must do it here */
+        uint8_t hdr_bits[6];
+        for (int i = 0; i < 6; i++)
+            hdr_bits[i] = data[i ^ 1];
+        uint32_t hdr_val = bits_to_uint(hdr_bits, 6);
         uint32_t hdr_syn = gf2_remainder(BCH_POLY_HDR, hdr_val);
         int hdr_ok = 0;
 
-        if (hdr_syn == 0) {
+        if (hdr_syn == 0)
             hdr_ok = 1;
-        } else if (hdr_syn < 16 && syn_hdr[hdr_syn].errs >= 0) {
-            hdr_val ^= syn_hdr[hdr_syn].locator;
-            hdr_ok = 1;
-        }
 
         if (hdr_ok) {
             uint8_t hdr_data[3];
@@ -425,7 +431,11 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
             int e2 = chase_bch_decode_p(di2,
                         data_llr ? li2 : NULL, d2, rc2);
 
-            if (e1 >= 0 && e2 >= 0 &&
+            /* Exact header and at most 3 repaired bits in the first two
+             * blocks: duplex sync/traffic payloads often sit within 2 bits
+             * of a codeword, and a false IBC adds a phantom satellite.
+             * 60 s capture vs iridium-parser: 206 of 250 found, 0 false. */
+            if (e1 >= 0 && e2 >= 0 && e1 + e2 <= 3 &&
                 check_parity32(di1, d1, BCH_RA_DATA, rc1, 10) &&
                 check_parity32(di2, d2, BCH_RA_DATA, rc2, 10)) {
                 /* IBC confirmed -- decode all blocks */
@@ -464,12 +474,12 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
                 out->type = FRAME_IBC;
                 parse_ibc(bch_stream, bch_len, bc_type, &out->ibc);
 
-                /* Reject hard-BCH false positives: Iridium uses 48 spot beams
-                 * per satellite. beam_id outside [1-48] indicates garbage. */
-                if (out->ibc.beam_id < 1 || out->ibc.beam_id > 48)
-                    return 0;
-
-                return 1;
+                /* Iridium has 48 spot beams; anything else is a false
+                 * positive, which may still be a valid IRA */
+                if (out->ibc.beam_id >= 1 && out->ibc.beam_id <= 48)
+                    return 1;
+                memset(&out->ibc, 0, sizeof(out->ibc));
+                out->type = FRAME_UNKNOWN;
             }
         }
     }
@@ -480,7 +490,7 @@ int frame_decode(const demod_frame_t *frame, decoded_frame_t *out)
      * BCH(31,21) t=2 corrects up to 2 errors per block; Chase extends
      * this with soft info. Three-block parity gate keeps false-positive
      * rate negligible even with correction enabled. */
-    if (data_len >= 96) {
+    if (is_dl && freq > F_SIMPLEX_MIN && data_len >= 96) {
         uint8_t ra1[32], ra2[32], ra3[32];
         float la1[32], la2[32], la3[32];
         de_interleave3(data, ra1, ra2, ra3);

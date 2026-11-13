@@ -211,6 +211,11 @@ add_executable(doppler_sim EXCLUDE_FROM_ALL tests/doppler_sim.c doppler_pos.c)
 target_link_libraries(doppler_sim m Threads::Threads)
 set_property(TARGET doppler_sim PROPERTY C_STANDARD 99)
 
+# Native IRA/IBC decoder over RAW lines: make raw_decode && ./raw_decode < x.raw
+add_executable(raw_decode EXCLUDE_FROM_ALL tests/raw_decode.c frame_decode.c)
+target_link_libraries(raw_decode m)
+set_property(TARGET raw_decode PROPERTY C_STANDARD 99)
+
 # Link required libraries
 target_link_libraries(iridium-sniffer PRIVATE
     Threads::Threads
