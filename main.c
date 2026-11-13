@@ -448,6 +448,10 @@ static void *zmq_sub_thread(void *arg) {
 
     /* Subscribe to all messages */
     zmq_setsockopt(zmq_sub_socket, ZMQ_SUBSCRIBE, "", 0);
+    /* Wake periodically so shutdown doesn't wait on an idle publisher */
+    int rcv_timeout_ms = 500;
+    zmq_setsockopt(zmq_sub_socket, ZMQ_RCVTIMEO, &rcv_timeout_ms,
+                   sizeof(rcv_timeout_ms));
 
     const char *ep = zmq_sub_endpoint ? zmq_sub_endpoint
                                       : ZMQ_SUB_DEFAULT_ENDPOINT;
@@ -474,7 +478,7 @@ static void *zmq_sub_thread(void *arg) {
         int rc = zmq_msg_recv(&msg, zmq_sub_socket, 0);
         if (rc < 0) {
             zmq_msg_close(&msg);
-            if (errno == EINTR)
+            if (errno == EINTR || errno == EAGAIN)
                 continue;
             break;
         }
@@ -931,9 +935,21 @@ static void *stats_thread_fn(void *arg) {
 
 /* ---- Signal handling ---- */
 
-static void sig_handler(int signo) {
+/* Threads kill(self_pid) to wake main; only external signals count toward
+ * force-quit, so a hung SDR setup or teardown can still be interrupted. */
+static void sig_handler(int signo, siginfo_t *info, void *uctx) {
     (void)signo;
+    (void)uctx;
+    if (info && info->si_pid == self_pid) {
+        running = 0;
+        return;
+    }
+    if (!running)
+        _exit(130);
     running = 0;
+    static const char msg[] = "\nStopping (Ctrl-C again to force quit)\n";
+    ssize_t r = write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)r;
 }
 
 /* ---- Main ---- */
@@ -964,10 +980,11 @@ int main(int argc, char **argv) {
     pthread_t sidekiq_thread;
 #endif
 
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
-    signal(SIGPIPE, SIG_IGN);
     self_pid = getpid();
+    struct sigaction sa = { .sa_sigaction = sig_handler, .sa_flags = SA_SIGINFO };
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
 
     parse_options(argc, argv);
 
@@ -1280,13 +1297,16 @@ int main(int argc, char **argv) {
         /* Already started above for context auto-detection */
     }
 
-    /* Wait for signal */
+    /* Wait for a signal. Polling instead of pause(): a signal landing
+     * between the check and pause() hung, and so did a HackRF unplug. */
     while (running) {
 #ifdef HAVE_HACKRF
-        if (live && hackrf != NULL && !hackrf_is_streaming(hackrf))
+        if (live && hackrf != NULL && hackrf_is_streaming(hackrf) != HACKRF_TRUE) {
+            warnx("HackRF stopped streaming");
             break;
+        }
 #endif
-        pause();
+        usleep(200000);
     }
     running = 0;
 

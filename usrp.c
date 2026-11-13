@@ -15,7 +15,8 @@
 
 #include "sdr.h"
 
-extern sig_atomic_t running;
+extern volatile sig_atomic_t running;
+extern pid_t self_pid;
 extern pid_t self_pid;
 extern double samp_rate;
 extern double center_freq;
@@ -224,8 +225,21 @@ void *usrp_stream_thread(void *arg) {
         buf = s->samples;
         uhd_rx_streamer_recv(rx_handle, &buf, num_samples, &md, 3.0, false, &num_rx_samples);
         uhd_rx_metadata_error_code(md, &error_code);
-        if (error_code != UHD_RX_METADATA_ERROR_CODE_NONE && error_code != 8)
-            errx(1, "Error during streaming: %u", error_code);
+        if (error_code == UHD_RX_METADATA_ERROR_CODE_TIMEOUT) {
+            warnx("USRP: receive timeout");
+            free(s);
+            continue;
+        }
+        /* Anything but overflow: stop through the normal shutdown so the
+         * stream is stopped and the device freed */
+        if (error_code != UHD_RX_METADATA_ERROR_CODE_NONE &&
+            error_code != UHD_RX_METADATA_ERROR_CODE_OVERFLOW) {
+            warnx("USRP: streaming error %u, stopping", error_code);
+            free(s);
+            running = 0;
+            kill(self_pid, SIGINT);
+            break;
+        }
         s->num = num_rx_samples;
 
         /* Extract hardware timestamp when time source is configured */

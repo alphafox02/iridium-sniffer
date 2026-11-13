@@ -17,7 +17,7 @@
 
 const unsigned num_transfers = 7;
 
-extern sig_atomic_t running;
+extern volatile sig_atomic_t running;
 extern pid_t self_pid;
 extern double samp_rate;
 extern double center_freq;

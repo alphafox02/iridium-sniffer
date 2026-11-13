@@ -855,6 +855,9 @@ void parse_options(int argc, char **argv) {
 #ifdef HAVE_SDRPLAY
         || sdrplay_serial
 #endif
+#ifdef HAVE_SIDEKIQ
+        || sidekiq_dev
+#endif
     )
         live = 1;
 

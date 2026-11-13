@@ -15,7 +15,7 @@
 extern double samp_rate;
 extern double center_freq;
 extern char *serial;
-extern sig_atomic_t running;
+extern volatile sig_atomic_t running;
 
 extern int hackrf_lna_gain;
 extern int hackrf_vga_gain;
