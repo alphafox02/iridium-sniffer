@@ -475,8 +475,8 @@ static void ringbuf_write(burst_detector_t *d, const float complex *samples, siz
         memcpy(d->ringbuf, samples + first, (n - first) * sizeof(float complex));
         d->ringbuf_write = n - first;
     }
-    /* Update the oldest available sample index */
-    uint64_t total_written = d->sample_count;
+    /* Oldest available sample index once this block is counted */
+    uint64_t total_written = d->sample_count + n;
     if (total_written > d->ringbuf_size)
         d->ringbuf_start = total_written - d->ringbuf_size;
 }
@@ -790,7 +790,7 @@ static void emit_gone_bursts(burst_detector_t *d, burst_callback_t cb, void *use
 
         /* Extract IQ samples from ringbuffer */
         uint64_t extract_start = ab->start;
-        uint64_t extract_stop = ab->stop + d->burst_pre_len;
+        uint64_t extract_stop = ab->stop;   /* [start, stop) as gr-iridium */
         size_t num_samples;
         float complex *samples = ringbuf_extract(d, extract_start, extract_stop,
                                                   &num_samples);
@@ -827,8 +827,8 @@ static void emit_gone_bursts(burst_detector_t *d, burst_callback_t cb, void *use
 
 /* ---- Public: feed samples ---- */
 
-void burst_detector_feed(burst_detector_t *d, const int8_t *iq,
-                         size_t num_samples, burst_callback_t cb, void *user) {
+static void feed_block_i8(burst_detector_t *d, const int8_t *iq,
+                          size_t num_samples, burst_callback_t cb, void *user) {
     /* Convert int8 IQ pairs to float complex and store in ringbuffer.
      * Process FFT frames as they become available.
      *
@@ -929,8 +929,8 @@ void burst_detector_feed(burst_detector_t *d, const int8_t *iq,
 
 /* ---- Public: feed float32 samples (no int8 quantization) ---- */
 
-void burst_detector_feed_cf32(burst_detector_t *d, const float *iq,
-                              size_t num_samples, burst_callback_t cb, void *user) {
+static void feed_block_cf32(burst_detector_t *d, const float *iq,
+                            size_t num_samples, burst_callback_t cb, void *user) {
     /* Track timestamp: prefer hardware timestamp from SDR if available */
     if (d->start_time_ns == 0) {
         if (d->pending_hw_ts != 0) {
@@ -950,8 +950,7 @@ void burst_detector_feed_cf32(burst_detector_t *d, const float *iq,
         d->convert_buf = malloc(sizeof(float complex) * d->convert_buf_size);
     }
 
-    for (size_t i = 0; i < num_samples; i++)
-        d->convert_buf[i] = iq[2 * i] + iq[2 * i + 1] * I;
+    memcpy(d->convert_buf, iq, sizeof(float complex) * num_samples);
 
     /* Write to ringbuffer */
     ringbuf_write(d, d->convert_buf, num_samples);
@@ -1049,4 +1048,33 @@ void *burst_detector_thread(void *arg) {
 
     burst_detector_destroy(det);
     return NULL;
+}
+
+/* Bursts are read back from the ring after a block is written, so a block
+ * must stay well under the ring size; ZMQ and large SDR buffers can exceed
+ * it at low sample rates. */
+static size_t feed_chunk(const burst_detector_t *d)
+{
+    size_t c = d->ringbuf_size / 4;
+    return c > 0 ? c : 1;
+}
+
+void burst_detector_feed(burst_detector_t *d, const int8_t *iq,
+                         size_t num_samples, burst_callback_t cb, void *user)
+{
+    size_t chunk = feed_chunk(d);
+    for (size_t off = 0; off < num_samples; off += chunk) {
+        size_t n = num_samples - off < chunk ? num_samples - off : chunk;
+        feed_block_i8(d, iq + 2 * off, n, cb, user);
+    }
+}
+
+void burst_detector_feed_cf32(burst_detector_t *d, const float *iq,
+                              size_t num_samples, burst_callback_t cb, void *user)
+{
+    size_t chunk = feed_chunk(d);
+    for (size_t off = 0; off < num_samples; off += chunk) {
+        size_t n = num_samples - off < chunk ? num_samples - off : chunk;
+        feed_block_cf32(d, iq + 2 * off, n, cb, user);
+    }
 }
