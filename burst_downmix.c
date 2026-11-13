@@ -50,7 +50,7 @@
 extern Blocking_Queue burst_queue;
 extern Blocking_Queue frame_queue;
 extern volatile sig_atomic_t running;
-extern atomic_ulong stat_n_frame_drops;
+extern atomic_ullong stat_n_frame_drops;
 extern int verbose;
 /* ---- Constants ---- */
 

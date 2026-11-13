@@ -152,8 +152,8 @@ extern Blocking_Queue samples_queue;
 extern Blocking_Queue burst_queue;
 extern volatile sig_atomic_t running;
 extern int verbose;
-extern atomic_ulong stat_n_detected;
-extern atomic_ulong stat_n_dropped;
+extern atomic_ullong stat_n_detected;
+extern atomic_ullong stat_n_dropped;
 
 /* ---- Helper: dynamic array push ---- */
 

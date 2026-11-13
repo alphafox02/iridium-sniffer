@@ -288,17 +288,17 @@ Blocking_Queue frame_queue;
 Blocking_Queue output_queue;
 
 /* Atomic stats counters (for gr-iridium compatible status line) */
-atomic_ulong stat_n_detected = 0;
-atomic_ulong stat_n_handled = 0;
-atomic_ulong stat_n_ok_bursts = 0;
-atomic_ulong stat_n_ok_sub = 0;
-atomic_ulong stat_n_dropped = 0;
-atomic_ulong stat_n_frame_drops = 0;
-atomic_ulong stat_n_output_drops = 0;
-atomic_ulong stat_sample_count = 0;
+atomic_ullong stat_n_detected = 0;
+atomic_ullong stat_n_handled = 0;
+atomic_ullong stat_n_ok_bursts = 0;
+atomic_ullong stat_n_ok_sub = 0;
+atomic_ullong stat_n_dropped = 0;
+atomic_ullong stat_n_frame_drops = 0;
+atomic_ullong stat_n_output_drops = 0;
+atomic_ullong stat_sample_count = 0;
 /* Samples discarded because the detector queue was full. Counted in samples,
  * not buffers, so it can be compared directly against stat_sample_count. */
-atomic_ulong stat_n_sample_drops = 0;
+atomic_ullong stat_n_sample_drops = 0;
 
 /* Global detector pointer for diagnostic stats (set by detector thread) */
 burst_detector_t *global_detector = NULL;
@@ -564,7 +564,7 @@ static ida_context_t ida_ctx;
 static ida_context_t acars_ida_ctx;
 static ida_context_t mtpos_ida_ctx;
 
-static atomic_ulong gsmtap_sent_count = 0;
+static atomic_ullong gsmtap_sent_count = 0;
 
 static void gsmtap_ida_cb(const uint8_t *data, int len,
                            uint64_t timestamp, double frequency,
@@ -852,7 +852,8 @@ static void *stats_thread_fn(void *arg) {
     unsigned long t0 = now_ms();
     unsigned long prev_t = t0;
     unsigned long prev_det = 0, prev_ok = 0, prev_sub = 0;
-    unsigned long prev_handled = 0, prev_samples = 0;
+    unsigned long prev_handled = 0;
+    uint64_t prev_samples = 0;
     unsigned q_max = 0;
 
     /* Sample-loss detection. Burst timestamps are derived from the SDR sample
@@ -861,7 +862,8 @@ static void *stats_thread_fn(void *arg) {
      * SoapyPlutoSDR) never surface an overflow, so comparing received samples
      * against elapsed time is the only way to see the loss. The baseline is
      * taken after the stream settles so activation latency is not counted. */
-    unsigned long loss_base_t = 0, loss_base_samp = 0, loss_base_drops = 0;
+    unsigned long loss_base_t = 0;
+    uint64_t loss_base_samp = 0, loss_base_drops = 0;
     int loss_warned = 0;
 
     while (running) {
@@ -879,11 +881,11 @@ static void *stats_thread_fn(void *arg) {
         unsigned long ok      = atomic_load(&stat_n_ok_bursts);
         unsigned long sub     = atomic_load(&stat_n_ok_sub);
         unsigned long dropped = atomic_load(&stat_n_dropped);
-        unsigned long samp    = atomic_load(&stat_sample_count);
+        uint64_t samp         = atomic_load(&stat_sample_count);
 
         /* Fraction of the expected sample stream that never arrived */
         double loss_pct = 0;
-        unsigned long sdrop = atomic_load(&stat_n_sample_drops);
+        uint64_t sdrop = atomic_load(&stat_n_sample_drops);
         /* Applies to any real-time source (SDR, ZMQ, VITA-49), but not to
          * file replay, which legitimately runs faster or slower than realtime
          * and reports that as srr instead. */
@@ -923,7 +925,7 @@ static void *stats_thread_fn(void *arg) {
         unsigned long dk    = ok      - prev_ok;
         unsigned long ds    = sub     - prev_sub;
         unsigned long dh    = handled - prev_handled;
-        unsigned long dsamp = samp    - prev_samples;
+        uint64_t dsamp      = samp    - prev_samples;
 
         /* Track max queue depth */
         unsigned qsz = (unsigned)samples_queue.queue_size;
@@ -1507,7 +1509,7 @@ int main(int argc, char **argv) {
     waypoint_db_destroy();
 
     if (gsmtap_enabled) {
-        fprintf(stderr, "iridium-sniffer: sent %lu GSMTAP packets\n",
+        fprintf(stderr, "iridium-sniffer: sent %llu GSMTAP packets\n",
                 atomic_load(&gsmtap_sent_count));
         gsmtap_shutdown();
     }
