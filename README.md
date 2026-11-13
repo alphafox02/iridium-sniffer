@@ -92,7 +92,7 @@ CMake output shows what was detected:
 
 The downmix worker count auto-scales based on CPU cores: 4 workers on 8+ cores, 2 on 4 cores, 1 on 2 cores. On low-power CPUs like the Intel N100 (4 cores), this prevents 100% CPU saturation that occurs when 4 workers compete for 4 cores. Override with `--workers=N` if needed.
 
-The Pi 5's VideoCore VII GPU passes basic Vulkan compute tests but cannot sustain the throughput needed for real-time FFT batch processing. Build CPU-only and use `--no-gpu`:
+The Pi 5's VideoCore VII GPU passes basic Vulkan compute tests but cannot sustain the throughput needed for real-time FFT batch processing. Build CPU-only; the GPU path is off unless `--gpu` is given:
 
 ```bash
 git clone https://github.com/alphafox02/iridium-sniffer.git
@@ -920,7 +920,8 @@ Gain options:
 
 Detection:
     -d, --threshold=DB      burst detection threshold in dB (default: 16.0)
-    --no-gpu                disable GPU acceleration (use CPU FFTW)
+    --gpu                   GPU burst-detection FFT (OpenCL/Vulkan); at
+                             8192 points the CPU path is usually faster
 
 Web map:
     --web[=PORT]            enable live web map (default port: 8888)
@@ -1035,12 +1036,12 @@ GPU acceleration offloads the burst detection FFT to the GPU. The rest of the si
 | NVIDIA | OpenCL | Full GPU pipeline, best performance |
 | AMD | OpenCL | ROCm or Mesa drivers |
 | Intel integrated | OpenCL | Via NEO or Beignet |
-| Raspberry Pi 5 | Vulkan | V3D passes validation but cannot sustain batch FFT throughput; use `--no-gpu` |
+| Raspberry Pi 5 | Vulkan | V3D passes validation but cannot sustain batch FFT throughput; don't use `--gpu` |
 | No GPU | CPU | FFTW fallback, handles 10 MHz fine on x86; ARM requires pre-generated wisdom (see above) |
 
 On fast x86 CPUs at 10 MHz, the CPU FFTW path keeps up easily. GPU acceleration is most beneficial for continuous live capture on desktop/laptop systems. A startup validation test verifies GPU correctness by running a test FFT with a known input.
 
-Both backends can be disabled at runtime with `--no-gpu`.
+The GPU path is off by default and enabled with `--gpu`. On a 60 s 10 MHz capture with an RTX 3060 it used about 2 s more CPU than the CPU FFTW path (10.2 s vs 8.2 s), since each batch is a blocking round trip. If GPU processing fails at runtime, detection falls back to the CPU path. `--no-gpu` is still accepted.
 
 ## Output Format
 

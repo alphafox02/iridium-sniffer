@@ -744,7 +744,11 @@ static void gpu_flush_batch(burst_detector_t *d) {
     if (d->gpu_process(d->gpu, d->gpu_batch_input,
                         d->gpu_batch_output,
                         d->gpu_batch_count) != 0) {
-        fprintf(stderr, "burst_detect: GPU processing failed\n");
+        /* Drop to the CPU path for good. index isn't advanced, so the
+         * next feed reprocesses these frames from the ring. */
+        fprintf(stderr, "burst_detect: GPU processing failed, using CPU FFT\n");
+        d->gpu_destroy(d->gpu);
+        d->gpu = NULL;
         d->gpu_batch_count = 0;
         return;
     }

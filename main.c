@@ -170,7 +170,7 @@ char *gsmtap_host = NULL;
 int gsmtap_port = GSMTAP_DEFAULT_PORT;
 
 /* GPU acceleration: enabled by default, loaded via dlopen plugin at runtime */
-int use_gpu = 1;
+int use_gpu = 0;
 
 int simd_mode = 0;  /* SIMD_AUTO */
 char *save_bursts_dir = NULL;
