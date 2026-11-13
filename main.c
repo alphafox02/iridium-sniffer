@@ -317,15 +317,23 @@ void parse_options(int argc, char **argv);
  * latency bounded, and the loss is reported as sl: in the status line. */
 #define SAMPLES_QUEUE_MAX_SEC 4
 
+/* Called only from the single SDR input thread. Dropped samples ride on
+ * the next queued buffer so the detector can keep timestamps aligned. */
 void push_samples(sample_buf_t *buf) {
-    atomic_fetch_add(&stat_sample_count, buf->num);
-    double backlog = (double)samples_queue.queue_size * buf->num;
+    static uint64_t pending_gap;
+    unsigned num = buf->num;
+    atomic_fetch_add(&stat_sample_count, num);
+    buf->gap_before = pending_gap;
+    double backlog = (double)samples_queue.queue_size * num;
     if (backlog >= samp_rate * SAMPLES_QUEUE_MAX_SEC ||
         blocking_queue_add(&samples_queue, buf) == BQ_FULL) {
-        atomic_fetch_add(&stat_n_sample_drops, buf->num);
+        atomic_fetch_add(&stat_n_sample_drops, num);
+        pending_gap += num;
         if (verbose)
             fprintf(stderr, "WARNING: dropped samples\n");
         free(buf);
+    } else {
+        pending_gap = 0;
     }
 }
 
@@ -402,6 +410,7 @@ static void *spewer_thread(void *arg) {
         }
         s->num = r;
         s->hw_timestamp_ns = 0;
+        s->gap_before = 0;
         atomic_fetch_add(&stat_sample_count, r);
         if (blocking_queue_put(&samples_queue, s) != 0) {
             free(s);

@@ -829,6 +829,32 @@ static void emit_gone_bursts(burst_detector_t *d, burst_callback_t cb, void *use
     d->num_gone_bursts = 0;
 }
 
+/* Wall time of sample 0. A hardware timestamp re-anchors at the current
+ * block, as gr-iridium does on every rx_time tag; without one the first
+ * block anchors to now minus its own duration. */
+static void update_time_anchor(burst_detector_t *d, size_t num_samples)
+{
+    uint64_t at = (uint64_t)((double)d->sample_count * 1e9 / d->sample_rate);
+    if (d->pending_hw_ts != 0 && d->pending_hw_ts > at) {
+        d->start_time_ns = d->pending_hw_ts - at;
+    } else if (d->start_time_ns == 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        uint64_t now = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        d->start_time_ns = now - at -
+            (uint64_t)((double)num_samples * 1e9 / d->sample_rate);
+    }
+    d->pending_hw_ts = 0;
+}
+
+/* Samples dropped upstream: move the time anchor so later timestamps stay
+ * on the wall clock. */
+static void add_gap(burst_detector_t *d, uint64_t n)
+{
+    if (d->start_time_ns != 0)
+        d->start_time_ns += (uint64_t)((double)n * 1e9 / d->sample_rate);
+}
+
 /* ---- Public: feed samples ---- */
 
 static void feed_block_i8(burst_detector_t *d, const int8_t *iq,
@@ -839,17 +865,7 @@ static void feed_block_i8(burst_detector_t *d, const int8_t *iq,
      * We maintain a residual buffer for partial FFT frames.
      */
 
-    /* Track timestamp: prefer hardware timestamp from SDR if available */
-    if (d->start_time_ns == 0) {
-        if (d->pending_hw_ts != 0) {
-            d->start_time_ns = d->pending_hw_ts;
-        } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-        }
-    }
-    d->pending_hw_ts = 0;
+    update_time_anchor(d, num_samples);
 
     /* Convert int8 to float complex and write to ringbuffer */
 
@@ -935,17 +951,7 @@ static void feed_block_i8(burst_detector_t *d, const int8_t *iq,
 
 static void feed_block_cf32(burst_detector_t *d, const float *iq,
                             size_t num_samples, burst_callback_t cb, void *user) {
-    /* Track timestamp: prefer hardware timestamp from SDR if available */
-    if (d->start_time_ns == 0) {
-        if (d->pending_hw_ts != 0) {
-            d->start_time_ns = d->pending_hw_ts;
-        } else {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            d->start_time_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-        }
-    }
-    d->pending_hw_ts = 0;
+    update_time_anchor(d, num_samples);
 
     /* Convert interleaved float pairs to float complex and write to ringbuffer */
     if (num_samples > d->convert_buf_size) {
@@ -1037,7 +1043,8 @@ void *burst_detector_thread(void *arg) {
         if (blocking_queue_take(&samples_queue, &samples) != 0)
             break;
 
-        /* Pass hardware timestamp to detector (used on first buffer only) */
+        if (samples->gap_before)
+            add_gap(det, samples->gap_before);
         if (samples->hw_timestamp_ns != 0)
             det->pending_hw_ts = samples->hw_timestamp_ns;
 

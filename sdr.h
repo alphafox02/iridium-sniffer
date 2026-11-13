@@ -19,6 +19,7 @@ typedef struct _sample_buf_t {
     unsigned num;
     int format;           /* SAMPLE_FMT_INT8 or SAMPLE_FMT_FLOAT */
     uint64_t hw_timestamp_ns;  /* hardware timestamp in ns (0 = not available) */
+    uint64_t gap_before;  /* samples dropped just before this buffer */
     int8_t samples[];     /* for SAMPLE_FMT_FLOAT: cast to float* (4x larger) */
 } sample_buf_t;
 
