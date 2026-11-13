@@ -476,14 +476,21 @@ static int resample_stage2(const burst_downmix_t *dm, const float complex *in,
         int n0 = (int)t;
         if (n0 + half >= n_in || n_out >= max_out)
             break;
-        float complex acc = 0;
-        for (int n = n0 - half + 1; n <= n0 + half; n++) {
-            double pos = (t - n) * RS_PHASES + center;
-            int j = (int)pos;
-            float fr = (float)(pos - j);
-            acc += (h[j] + fr * (h[j + 1] - h[j])) * in[n];
+        /* Prototype index for in[n] is (t - n) * RS_PHASES + center; the
+         * fractional part is the same for every tap */
+        double ph = (t - n0) * RS_PHASES;
+        int p = (int)ph;
+        float fr = (float)(ph - p);
+        const float *hp = h + p + center + (half - 1) * RS_PHASES;
+        const float *x = (const float *)&in[n0 - half + 1];
+        float ar = 0, ai = 0;
+        for (int k = 0; k < 2 * half; k++) {
+            const float *hk = hp - k * RS_PHASES;
+            float tap = hk[0] + fr * (hk[1] - hk[0]);
+            ar += tap * x[2 * k];
+            ai += tap * x[2 * k + 1];
         }
-        out[n_out++] = acc;
+        out[n_out++] = ar + ai * I;
     }
     return n_out;
 }

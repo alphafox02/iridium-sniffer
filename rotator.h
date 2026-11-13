@@ -36,7 +36,7 @@ static inline void rotator_set_phase_incr(rotator_t *r, float complex incr) {
 
 /* Rotate n samples: out[i] = in[i] * phase; phase *= phase_incr.
  * Blocks of ROTATOR_BLOCK with precomputed steps break the serial phase
- * dependency so the inner loop vectorizes; phase is renormalized per block. */
+ * dependency so the inner loop vectorizes; phase is renormalized as it goes. */
 static inline void rotator_rotate_n(rotator_t *r, float complex *out,
                                      const float complex *in, int n) {
     float sr[ROTATOR_BLOCK], si[ROTATOR_BLOCK];
@@ -61,7 +61,12 @@ static inline void rotator_rotate_n(rotator_t *r, float complex *out,
             y[2 * (i + k) + 1] = xr * wi + xi * wr;
         }
         r->phase *= block_incr;
-        r->phase /= cabsf(r->phase);
+        if ((i & (64 * ROTATOR_BLOCK - 1)) == 0) {
+            /* |phase| stays near 1: one Newton step for 1/|phase| */
+            float m2 = crealf(r->phase) * crealf(r->phase) +
+                       cimagf(r->phase) * cimagf(r->phase);
+            r->phase *= 0.5f * (3.0f - m2);
+        }
     }
     for (; i < n; i++) {
         out[i] = in[i] * r->phase;
