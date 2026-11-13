@@ -644,11 +644,9 @@ static int correlate_sync(burst_downmix_t *dm, const float complex *frame,
     /* Preamble starts at: corr_offset - sync_len + 1 */
     int preamble_offset = corr_offset - sync_len + 1;
 
-    /* UW starts after preamble (16 symbols for DL, 32 for UL) */
-    int preamble_symbols = (*direction == DIR_DOWNLINK)
-        ? IR_PREAMBLE_LENGTH_SHORT : 32;
+    /* Both templates are a 16-symbol preamble tail plus the UW */
     int uw_start = preamble_offset +
-                   (int)(preamble_symbols * dm->samples_per_symbol);
+                   (int)(IR_PREAMBLE_LENGTH_SHORT * dm->samples_per_symbol);
 
     return uw_start;
 }
