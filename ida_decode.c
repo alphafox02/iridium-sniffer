@@ -97,8 +97,10 @@ void ida_decode_init(void)
 {
     build_syn(BCH_POLY_DA, 31, 2, syn_da, BCH_DA_TABLE);
     build_syn(BCH_POLY_LCW1, 7, 1, syn_lcw1, 16);
-    build_syn(BCH_POLY_LCW2, 14, 1, syn_lcw2, 256);
-    build_syn(BCH_POLY_LCW3, 26, 2, syn_lcw3, 32);
+    /* Error budgets as iridium-toolkit; lcw3 has a 5-bit syndrome, so a
+     * 2-error table would cover every syndrome and never reject */
+    build_syn(BCH_POLY_LCW2, 14, 2, syn_lcw2, 256);
+    build_syn(BCH_POLY_LCW3, 26, 1, syn_lcw3, 32);
 }
 
 /* Chase decoder: flip up to N least-reliable bits, retry BCH */
@@ -222,13 +224,25 @@ int decode_lcw(const uint8_t *data, int data_len, lcw_t *lcw)
     }
     int ft = (int)(v1 >> 4) & 0x7;  /* top 3 data bits */
 
-    /* lcw2: bits 7-19 + padding zero = 14 bits, poly=465 */
-    uint32_t v2 = (bits_to_uint(lcw_bits + 7, 13) << 1);  /* 13 bits + trailing 0 */
-    uint32_t s2 = gf2_remainder(BCH_POLY_LCW2, v2);
-    if (s2 != 0) {
-        if (s2 >= 256 || syn_lcw2[s2].errs < 0) return 0;
-        v2 ^= syn_lcw2[s2].locator;
+    /* lcw2: bits 7-19 plus one missing bit = 14 bits, poly=465. Try both
+     * values of the missing bit and keep the one needing fewer fixes. */
+    uint32_t v2 = 0;
+    int e2 = -1;
+    for (uint32_t pad = 0; pad < 2; pad++) {
+        uint32_t v = (bits_to_uint(lcw_bits + 7, 13) << 1) | pad;
+        uint32_t s2 = gf2_remainder(BCH_POLY_LCW2, v);
+        int e = 0;
+        if (s2 != 0) {
+            if (s2 >= 256 || syn_lcw2[s2].errs < 0) continue;
+            e = syn_lcw2[s2].errs;
+            v ^= syn_lcw2[s2].locator;
+        }
+        if (e2 < 0 || e < e2) {
+            e2 = e;
+            v2 = v;
+        }
     }
+    if (e2 < 0) return 0;
 
     /* lcw3: bits 20-45, 26 bits, poly=41 */
     uint32_t v3 = bits_to_uint(lcw_bits + 20, 26);
@@ -251,7 +265,7 @@ int decode_lcw(const uint8_t *data, int data_len, lcw_t *lcw)
     lcw->lcw_ft = (lcw2_data >> 4) & 0x3;    /* top 2 bits of lcw2 data */
     lcw->lcw_code = lcw2_data & 0xF;         /* bottom 4 bits of lcw2 data */
     lcw->lcw3_val = (uint32_t)lcw3_data;
-    lcw->ec_lcw = (s1 != 0) + (s2 != 0) + (s3 != 0);
+    lcw->ec_lcw = (s1 != 0) + (e2 > 0) + (s3 != 0);
     return 1;
 }
 
@@ -562,14 +576,16 @@ int ida_decode(const demod_frame_t *frame, ida_burst_t *burst)
     lcw_t lcw;
     if (!decode_lcw(data, data_len, &lcw))
         return 0;
-    /* Frame type: 2 = downlink IDA, 6/7 = uplink IDA */
-    if (lcw.ft != 2 && lcw.ft != 6 && lcw.ft != 7)
+    /* ft 2 is DA in both directions; 6 is U6 and 7 is sync */
+    if (lcw.ft != 2)
         return 0;
 
     /* Descramble + Chase BCH decode payload (skip 46 LCW bits) */
     const uint8_t *payload_data = data + 46;
     const float *payload_llr = data_llr ? data_llr + 46 : NULL;
     int payload_len = data_len - 46;
+    if (payload_len > 312)
+        payload_len = 312;   /* the toolkit's data[:312]; the rest is extra */
     if (payload_len < 124)
         return 0;
 
@@ -657,9 +673,10 @@ int ida_decode(const demod_frame_t *frame, ida_burst_t *burst)
     memcpy(burst->payload, payload, burst->payload_len);
 
     /* Store full BCH stream and LCW for parsed output */
+    if (bch_len > (int)sizeof(burst->bch_stream))
+        bch_len = (int)sizeof(burst->bch_stream);
     burst->bch_len = bch_len;
-    memcpy(burst->bch_stream, bch_stream,
-           bch_len < (int)sizeof(burst->bch_stream) ? bch_len : (int)sizeof(burst->bch_stream));
+    memcpy(burst->bch_stream, bch_stream, bch_len);
     burst->lcw = lcw;
 
     /* Format LCW header string */
