@@ -479,12 +479,13 @@ void *vita49_thread(void *arg)
             /* 4 bytes per complex sample (2 x int16), big-endian in VRT */
             num_samples = payload_bytes / 4;
             if (num_samples == 0) continue;
-            s = malloc(sizeof(*s) + num_samples * 2);
+            s = malloc(sizeof(*s) + num_samples * 8);
             if (!s) continue;
-            s->format = SAMPLE_FMT_INT8;
-            const int16_t *src = (const int16_t *)payload;
+            s->format = SAMPLE_FMT_FLOAT;
+            const uint16_t *src = (const uint16_t *)payload;
+            float *out = (float *)s->samples;
             for (size_t i = 0; i < num_samples * 2; i++)
-                s->samples[i] = (int8_t)(ntohs(src[i]) >> 8);
+                out[i] = (int16_t)ntohs(src[i]) * (1.0f / 32768.0f);
             break;
         }
 

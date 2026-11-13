@@ -45,6 +45,7 @@ typedef enum {
     FMT_CI8 = 0,
     FMT_CI16,
     FMT_CF32,
+    FMT_CU8,
 } iq_format_t;
 
 extern double samp_rate;
@@ -150,7 +151,7 @@ static void usage(int exitcode) {
 "Input (one required):\n"
 "    -f, --file=FILE         read IQ samples from file\n"
 "    -l, --live              capture live from SDR (implied by -i)\n"
-"    --format=FMT            IQ file format: ci8 (default), ci16, cf32\n"
+"    --format=FMT            IQ file format: ci8 (default), ci16, cf32, cu8\n"
 "\n"
 "SDR options:\n"
 "    -i, --interface=IFACE   SDR to use (see --list for available devices):\n"
@@ -479,8 +480,10 @@ void parse_options(int argc, char **argv) {
                     iq_format = FMT_CI16;
                 else if (strcmp(optarg, "cf32") == 0)
                     iq_format = FMT_CF32;
+                else if (strcmp(optarg, "cu8") == 0)
+                    iq_format = FMT_CU8;
                 else
-                    errx(1, "Unknown format '%s'. Use ci8, ci16, or cf32.", optarg);
+                    errx(1, "Unknown format '%s'. Use ci8, ci16, cf32 or cu8.", optarg);
                 break;
 
             case OPT_LIST:
@@ -880,6 +883,8 @@ void parse_options(int argc, char **argv) {
             else if (strcmp(ext, ".ci16") == 0 || strcmp(ext, ".cs16") == 0 ||
                      strcmp(ext, ".sc16") == 0)
                 iq_format = FMT_CI16;
+            else if (strcmp(ext, ".cu8") == 0)
+                iq_format = FMT_CU8;
             /* .ci8 and other extensions keep the ci8 default */
         }
     }
@@ -922,7 +927,7 @@ void parse_options(int argc, char **argv) {
                                 &sigmf_fmt) == 0) {
                 if (sigmf_fmt >= 0 && !format_explicit) {
                     iq_format = (iq_format_t)sigmf_fmt;
-                    const char *fmt_names[] = { "ci8", "ci16", "cf32" };
+                    const char *fmt_names[] = { "ci8", "ci16", "cf32", "cu8" };
                     fprintf(stderr, "sigmf: auto-detected format=%s\n",
                             fmt_names[iq_format]);
                 }

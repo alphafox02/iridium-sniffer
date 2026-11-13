@@ -19,6 +19,7 @@
 #define FMT_CI8  0
 #define FMT_CI16 1
 #define FMT_CF32 2
+#define FMT_CU8  3
 
 /*
  * Map SigMF core:datatype string to internal IQ format.
@@ -49,10 +50,9 @@ static int sigmf_parse_datatype(const char *dt)
     if (strcmp(dt, "ci8") == 0)
         return FMT_CI8;
 
-    /* Complex unsigned int 8-bit -- treat as ci8 (common SDR format,
-     * needs DC offset correction but the burst detector handles it) */
+    /* Complex unsigned int 8-bit, offset 128 */
     if (strcmp(dt, "cu8") == 0)
-        return FMT_CI8;
+        return FMT_CU8;
 
     return -1;
 }

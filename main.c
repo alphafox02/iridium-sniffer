@@ -101,6 +101,7 @@ typedef enum {
     FMT_CI8 = 0,   /* interleaved int8 (default, SDR native) */
     FMT_CI16,       /* interleaved int16 */
     FMT_CF32,       /* interleaved float32 */
+    FMT_CU8,        /* interleaved uint8, offset 128 (rtl_sdr) */
 } iq_format_t;
 
 /* ---- Global configuration ---- */
@@ -361,16 +362,24 @@ static void *spewer_thread(void *arg) {
             break;
 
         case FMT_CI16: {
-            /* 4 bytes per sample -> convert to int8 */
-            s = malloc(sizeof(*s) + block * 2);
-            s->format = SAMPLE_FMT_INT8;
-            int16_t *tmp = malloc(block * 4);
+            /* To float: >> 8 to int8 kept ~4 bits of a 12-bit capture */
+            s = malloc(sizeof(*s) + block * 8);
+            s->format = SAMPLE_FMT_FLOAT;
+            int16_t *tmp = (int16_t *)s->samples + block * 2;
             r = fread(tmp, 4, block, f);
+            float *out = (float *)s->samples;
             for (size_t i = 0; i < r * 2; i++)
-                s->samples[i] = (int8_t)(tmp[i] >> 8);
-            free(tmp);
+                out[i] = tmp[i] * (1.0f / 32768.0f);
             break;
         }
+
+        case FMT_CU8:
+            s = malloc(sizeof(*s) + block * 2);
+            s->format = SAMPLE_FMT_INT8;
+            r = fread(s->samples, 2, block, f);
+            for (size_t i = 0; i < r * 2; i++)
+                s->samples[i] ^= (int8_t)0x80;
+            break;
 
         case FMT_CF32: {
             /* Pass float32 samples directly (no int8 quantization) */
@@ -455,7 +464,8 @@ static void *zmq_sub_thread(void *arg) {
 
     fprintf(stderr, "zmq-sub: connected to %s (format=%s)\n", ep,
             iq_format == FMT_CF32 ? "cf32" :
-            iq_format == FMT_CI16 ? "cs16" : "cs8");
+            iq_format == FMT_CI16 ? "cs16" :
+            iq_format == FMT_CU8 ? "cu8" : "cs8");
 
     while (running) {
         zmq_msg_t msg;
@@ -486,16 +496,25 @@ static void *zmq_sub_thread(void *arg) {
             break;
 
         case FMT_CI16: {
-            /* 4 bytes per sample -> convert to int8 */
             num_samples = len / 4;
+            if (num_samples == 0) { zmq_msg_close(&msg); continue; }
+            s = malloc(sizeof(*s) + num_samples * 8);
+            s->format = SAMPLE_FMT_FLOAT;
+            const int16_t *src = (const int16_t *)data;
+            float *out = (float *)s->samples;
+            for (size_t i = 0; i < num_samples * 2; i++)
+                out[i] = src[i] * (1.0f / 32768.0f);
+            break;
+        }
+
+        case FMT_CU8:
+            num_samples = len / 2;
             if (num_samples == 0) { zmq_msg_close(&msg); continue; }
             s = malloc(sizeof(*s) + num_samples * 2);
             s->format = SAMPLE_FMT_INT8;
-            int16_t *src = (int16_t *)data;
             for (size_t i = 0; i < num_samples * 2; i++)
-                s->samples[i] = (int8_t)(src[i] >> 8);
+                s->samples[i] = (int8_t)(((const uint8_t *)data)[i] ^ 0x80);
             break;
-        }
 
         case FMT_CI8:
         default:
