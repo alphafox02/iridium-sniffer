@@ -53,6 +53,7 @@ static __thread float complex *work_pll_out   = NULL;
 static __thread int           *work_symbols   = NULL;
 static __thread float         *work_offsets   = NULL;
 static __thread float         *work_magnitudes = NULL;
+static __thread float         *work_cum_phase = NULL;
 static __thread int            work_capacity  = 0;
 
 static int ensure_work_buffers(int max_symbols) {
@@ -64,12 +65,14 @@ static int ensure_work_buffers(int max_symbols) {
     int           *s = realloc(work_symbols,   cap * sizeof(int));
     float         *o = realloc(work_offsets,   cap * sizeof(float));
     float         *m = realloc(work_magnitudes, cap * sizeof(float));
-    if (!d || !p || !s || !o || !m) return 0;
-    work_decimated  = d;
-    work_pll_out    = p;
-    work_symbols    = s;
-    work_offsets    = o;
-    work_magnitudes = m;
+    float         *c = realloc(work_cum_phase, cap * sizeof(float));
+    if (d) work_decimated = d;
+    if (p) work_pll_out = p;
+    if (s) work_symbols = s;
+    if (o) work_offsets = o;
+    if (m) work_magnitudes = m;
+    if (c) work_cum_phase = c;
+    if (!d || !p || !s || !o || !m || !c) return 0;
     work_capacity   = cap;
     return 1;
 }
@@ -171,8 +174,9 @@ static int decimate_simple(const float complex *in, int n_samples,
 
 /* ---- First-order PLL for QPSK phase tracking ---- */
 
+/* cum_phase[i] gets the total phase correction through symbol i */
 static float qpsk_pll(const float complex *in, float complex *out,
-                       int n_symbols, float alpha)
+                       int n_symbols, float alpha, float *cum_phase)
 {
     float complex phi_hat = 1.0f + 0.0f * I;
     float total_phase = 0.0f;
@@ -198,6 +202,7 @@ static float qpsk_pll(const float complex *in, float complex *out,
         /* Error signal: rotate by conjugate of ideal */
         float complex er = conjf(x_hat) * out[i];
         float er_mag = cabsf(er);
+        cum_phase[i] = total_phase;
         if (er_mag < 1e-10f)
             continue;
 
@@ -210,6 +215,7 @@ static float qpsk_pll(const float complex *in, float complex *out,
         float complex correction = cosf(scaled_angle) + sinf(scaled_angle) * I;
 
         total_phase += scaled_angle;
+        cum_phase[i] = total_phase;
 
         /* Update phase estimate */
         phi_hat = conjf(correction) * phi_hat;
@@ -422,7 +428,8 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
     int sps = (int)(in->samples_per_symbol + 0.5f);
     if (sps < 1) sps = 1;
 
-    int max_symbols = (int)in->num_samples / sps + 1;
+    /* Gardner steps can be as short as sps - 0.5 */
+    int max_symbols = (int)(in->num_samples / (sps - 0.5f)) + 2;
     if (!ensure_work_buffers(max_symbols))
         return 0;
     float complex *decimated = work_decimated;
@@ -439,7 +446,7 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
                                     in->samples_per_symbol, decimated);
 
     /* Step 2: PLL phase correction */
-    float total_phase = qpsk_pll(decimated, pll_out, n_symbols, PLL_ALPHA);
+    qpsk_pll(decimated, pll_out, n_symbols, PLL_ALPHA, work_cum_phase);
 
     /* Step 3: Hard-decision QPSK demod + confidence */
     float level;
@@ -534,11 +541,12 @@ int qpsk_demod(downmix_frame_t *in, demod_frame_t **out)
     frame->llr = llr;
     frame->n_bits = n_bits;
 
-    /* Refine center frequency with PLL-measured residual CFO */
+    /* Refine center frequency with the PLL's residual CFO over the frame
+     * itself; the noise tail after the last symbol only adds error */
     if (actual_symbols > 0) {
         double duration = (double)actual_symbols / IR_SYMBOLS_PER_SECOND;
         frame->center_frequency = in->center_frequency +
-            total_phase / duration / M_PI / 2.0;
+            work_cum_phase[actual_symbols - 1] / duration / M_PI / 2.0;
     } else {
         frame->center_frequency = in->center_frequency;
     }
