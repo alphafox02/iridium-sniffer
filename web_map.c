@@ -272,8 +272,17 @@ void web_map_add_sat(const ibc_data_t *ibc, uint64_t timestamp)
         }
     }
 
-    if (idx < 0 && state.n_sats < MAX_SATELLITES) {
-        idx = state.n_sats++;
+    if (idx < 0) {
+        if (state.n_sats < MAX_SATELLITES) {
+            idx = state.n_sats++;
+        } else {
+            /* Full: reuse the entry seen longest ago, or new satellites
+             * would never appear on a long run */
+            idx = 0;
+            for (int i = 1; i < state.n_sats; i++)
+                if (state.sats[i].last_seen < state.sats[idx].last_seen)
+                    idx = i;
+        }
         state.sats[idx].sat_id = ibc->sat_id;
         state.sats[idx].count = 0;
     }
