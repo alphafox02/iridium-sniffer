@@ -28,6 +28,7 @@
 
 #include "aircraft_db.h"
 #include "basestation.h"
+#include "net_util.h"
 
 extern volatile int running;
 
@@ -120,9 +121,6 @@ static void *bs_accept_thread(void *arg)
  */
 static int bs_client_connect(void)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(bs_remote_port),
@@ -132,20 +130,17 @@ static int bs_client_connect(void)
         /* Try DNS resolution */
         struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
         struct addrinfo *res = NULL;
-        if (getaddrinfo(bs_remote_host, NULL, &hints, &res) != 0 || !res) {
-            close(fd);
+        if (getaddrinfo(bs_remote_host, NULL, &hints, &res) != 0 || !res)
             return -1;
-        }
         memcpy(&addr.sin_addr,
                &((struct sockaddr_in *)res->ai_addr)->sin_addr,
                sizeof(addr.sin_addr));
         freeaddrinfo(res);
     }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
+    int fd = tcp_connect_timeout((struct sockaddr *)&addr, sizeof(addr), 3000);
+    if (fd < 0)
         return -1;
-    }
 
     set_nonblocking(fd);
     int one = 1;

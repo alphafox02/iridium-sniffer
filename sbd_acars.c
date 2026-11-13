@@ -74,6 +74,7 @@ typedef struct {
     struct sockaddr_in udp_addr;   /* UDP only */
     char *tcp_host;                /* TCP only (for reconnect) */
     int tcp_port;                  /* TCP only */
+    time_t retry_at;               /* TCP only: next reconnect attempt */
 } feed_ep_t;
 static feed_ep_t feeds[FEED_MAX];
 static int n_feeds = 0;
@@ -162,24 +163,32 @@ static int feed_tcp_connect(const char *host, int port)
     if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res)
         return -1;
 
-    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (fd < 0) {
-        freeaddrinfo(res);
-        return -1;
-    }
-
-    if (connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
-        close(fd);
-        freeaddrinfo(res);
-        return -1;
-    }
+    int fd = tcp_connect_timeout(res->ai_addr, res->ai_addrlen, 3000);
     freeaddrinfo(res);
+    if (fd < 0)
+        return -1;
 
-    /* Disable Nagle for low-latency sends */
+    /* Disable Nagle for low-latency sends; a peer that stops reading must
+     * not block the output thread */
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+    struct timeval sto = { .tv_sec = 2 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
 
     return fd;
+}
+
+/* Whole buffer or failure; send() may write only part of it */
+static int send_all(int fd, const char *buf, size_t len)
+{
+    while (len > 0) {
+        ssize_t r = send(fd, buf, len, MSG_NOSIGNAL);
+        if (r <= 0)
+            return -1;
+        buf += r;
+        len -= (size_t)r;
+    }
+    return 0;
 }
 
 static void hub_buf_emit(void)
@@ -200,21 +209,22 @@ static void hub_buf_emit(void)
                 }
             }
         } else {
-            /* TCP feed -- reconnect if needed */
-            if (f->fd < 0 && f->tcp_host) {
+            /* TCP feed -- reconnect at most every 10 s, not per message */
+            if (f->fd < 0 && f->tcp_host && time(NULL) >= f->retry_at) {
                 f->fd = feed_tcp_connect(f->tcp_host, f->tcp_port);
                 if (f->fd >= 0)
                     fprintf(stderr, "ACARS: reconnected to %s:%d\n",
                             f->tcp_host, f->tcp_port);
+                else
+                    f->retry_at = time(NULL) + 10;
             }
 
             if (f->fd >= 0) {
-                ssize_t r = send(f->fd, hub_buf, hub_pos, MSG_NOSIGNAL);
-                if (r > 0)
-                    r = send(f->fd, "\n", 1, MSG_NOSIGNAL);
-                if (r <= 0) {
+                if (send_all(f->fd, hub_buf, hub_pos) != 0 ||
+                    send_all(f->fd, "\n", 1) != 0) {
                     close(f->fd);
                     f->fd = -1;
+                    f->retry_at = time(NULL) + 10;
                 }
             }
         }
