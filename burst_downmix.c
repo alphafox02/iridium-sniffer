@@ -60,6 +60,10 @@ extern int verbose;
 #define RRC_ALPHA           0.4f
 #define START_THRESHOLD     0.45f
 #define PRE_START_US        100  /* microseconds before burst start */
+#define RS_STAGE1_RATE      1e6     /* integer decimation down to about this */
+#define RS_PASS_HZ          40000.0 /* kept around the burst centre */
+#define RS_ATTEN_DB         60.0
+#define RS_PHASES           64      /* stage-2 prototype points per input sample */
 
 /* ---- Internal state ---- */
 
@@ -71,7 +75,15 @@ struct _burst_downmix {
     float samples_per_symbol;
 
     /* Filters */
-    fir_filter_t *input_fir;    /* anti-alias LPF for decimation */
+    /* Input resampling to exactly output_sample_rate, built for the
+     * first burst's input rate: integer decimation, then fractional */
+    int rs_in_rate;
+    int rs_d1;
+    fir_filter_t *rs_fir1;
+    float *rs_proto;
+    int rs_proto_len;
+    int rs_half;                /* stage-2 half span, stage-1 samples */
+    double rs_step;             /* stage-1 samples per output sample */
     fir_filter_t *noise_fir;    /* noise-limiting LPF after decimation */
     fir_filter_t *start_fir;    /* magnitude smoothing */
     fir_filter_t *rrc_fir;      /* root-raised-cosine matched filter */
@@ -256,19 +268,6 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
                 dm->search_depth, dm->pre_start_samples);
     }
 
-    /* ---- Input anti-alias LPF ---- */
-    {
-        float cutoff = dm->output_sample_rate * 0.4f;
-        float transition = dm->output_sample_rate * 0.2f;
-        /* Use a reasonable input sample rate for tap design.
-         * The actual decimation ratio depends on the burst's input rate.
-         * We design for a generic 10 MHz input. */
-        int ntaps;
-        float *taps = lpf_taps(&ntaps, 1.0f, 10000000.0f, cutoff, transition);
-        dm->input_fir = fir_filter_create(taps, ntaps);
-        free(taps);
-    }
-
     /* ---- Noise-limiting LPF (applied after decimation) ---- */
     {
         float burst_width = 40000.0f;  /* Hz, matches IR_DEFAULT_BURST_WIDTH */
@@ -387,7 +386,8 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
 void burst_downmix_destroy(burst_downmix_t *dm) {
     if (!dm) return;
 
-    fir_filter_destroy(dm->input_fir);
+    fir_filter_destroy(dm->rs_fir1);
+    free(dm->rs_proto);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -424,27 +424,96 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
     free(dm);
 }
 
-/* ---- Step 2: Decimate ---- */
+/* ---- Step 2: Resample to output_sample_rate ---- */
 
-static int decimate_burst(burst_downmix_t *dm, const float complex *in, int in_len,
-                           float complex *out, int in_sample_rate,
-                           uint64_t *timestamp) {
-    int decimation = (int)roundf((float)in_sample_rate / dm->output_sample_rate);
-    if (decimation < 1) decimation = 1;
+/* Stage 1 drops to about RS_STAGE1_RATE with a short real FIR; anything
+ * that would fold onto the kept band is at least fs1 - RS_PASS_HZ away.
+ * Stage 2 is an interpolated polyphase filter, so any input rate (2.4,
+ * 2.048, 6 MHz...) lands on exactly output_sample_rate. */
+static void resampler_setup(burst_downmix_t *dm, int in_rate)
+{
+    double out_rate = dm->output_sample_rate;
+    dm->rs_in_rate = in_rate;
+    dm->rs_d1 = (int)(in_rate / RS_STAGE1_RATE);
+    if (dm->rs_d1 < 1) dm->rs_d1 = 1;
+    double fs1 = (double)in_rate / dm->rs_d1;
 
-    int n_out = (in_len - dm->input_fir->ntaps + 1) / decimation;
-    if (n_out <= 0) return 0;
-    if (n_out > dm->work_size) n_out = dm->work_size;
-
-    fir_filter_ccf_dec(dm->input_fir, out, in, n_out, decimation);
-
-    /* Adjust timestamp for filter delay */
-    if (timestamp) {
-        uint64_t delay_ns = (uint64_t)((dm->input_fir->ntaps / 2) *
-                            1000000000ULL / in_sample_rate);
-        *timestamp += delay_ns;
+    fir_filter_destroy(dm->rs_fir1);
+    dm->rs_fir1 = NULL;
+    if (dm->rs_d1 > 1) {
+        int n = kaiser_ntaps(in_rate, fs1 - 2 * RS_PASS_HZ, RS_ATTEN_DB);
+        float *taps = kaiser_lpf_taps(n, 1.0f, in_rate, fs1 / 2, RS_ATTEN_DB);
+        if (!taps) errx(1, "burst_downmix: out of memory");
+        dm->rs_fir1 = fir_filter_create(taps, n);
+        free(taps);
     }
 
+    double proto_rate = fs1 * RS_PHASES;
+    int n = kaiser_ntaps(proto_rate, out_rate - 2 * RS_PASS_HZ, RS_ATTEN_DB);
+    dm->rs_half = (n / RS_PHASES + 2) / 2;
+    dm->rs_proto_len = 2 * dm->rs_half * RS_PHASES + 1;
+    free(dm->rs_proto);
+    dm->rs_proto = kaiser_lpf_taps(dm->rs_proto_len, RS_PHASES, proto_rate,
+                                   out_rate / 2, RS_ATTEN_DB);
+    if (!dm->rs_proto) errx(1, "burst_downmix: out of memory");
+    dm->rs_step = fs1 / out_rate;
+
+    if (verbose)
+        fprintf(stderr, "burst_downmix: %d Hz in -> /%d (%d taps) -> %.0f Hz "
+                "(%d taps/output)\n", in_rate, dm->rs_d1,
+                dm->rs_fir1 ? dm->rs_fir1->ntaps : 0, out_rate, 2 * dm->rs_half);
+}
+
+static int resample_stage2(const burst_downmix_t *dm, const float complex *in,
+                           int n_in, float complex *out, int max_out)
+{
+    int half = dm->rs_half, center = half * RS_PHASES;
+    const float *h = dm->rs_proto;
+    int n_out = 0;
+
+    for (;;) {
+        double t = half + n_out * dm->rs_step;
+        int n0 = (int)t;
+        if (n0 + half >= n_in || n_out >= max_out)
+            break;
+        float complex acc = 0;
+        for (int n = n0 - half + 1; n <= n0 + half; n++) {
+            double pos = (t - n) * RS_PHASES + center;
+            int j = (int)pos;
+            float fr = (float)(pos - j);
+            acc += (h[j] + fr * (h[j + 1] - h[j])) * in[n];
+        }
+        out[n_out++] = acc;
+    }
+    return n_out;
+}
+
+/* in is clobbered; result goes to out. timestamp moves to output sample 0. */
+static int resample_burst(burst_downmix_t *dm, float complex *in, int in_len,
+                          float complex *out, int in_sample_rate,
+                          uint64_t *timestamp) {
+    if (in_sample_rate != dm->rs_in_rate)
+        resampler_setup(dm, in_sample_rate);
+
+    const float complex *s1 = in;
+    int n1 = in_len;
+    double delay = 0;   /* input samples from in[0] to output sample 0 */
+    if (dm->rs_d1 > 1) {
+        n1 = (in_len - dm->rs_fir1->ntaps + 1) / dm->rs_d1;
+        if (n1 <= 0) return 0;
+        fir_filter_ccf_dec(dm->rs_fir1, out, in, n1, dm->rs_d1);
+        s1 = out;
+        delay = (dm->rs_fir1->ntaps - 1) / 2.0;
+    }
+    delay += (double)dm->rs_half * dm->rs_d1;
+
+    float complex *dst = (s1 == out) ? in : out;
+    int n_out = resample_stage2(dm, s1, n1, dst, dm->work_size);
+    if (dst != out)
+        memcpy(out, dst, n_out * sizeof(float complex));
+
+    if (timestamp)
+        *timestamp += (uint64_t)(delay * 1e9 / in_sample_rate);
     return n_out;
 }
 
@@ -663,9 +732,6 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     int n = (int)burst->num_samples;
     if (n > dm->work_size) n = dm->work_size;
 
-    /* Copy burst samples to working buffer */
-    memcpy(dm->work_a, burst->samples, n * sizeof(float complex));
-
     double center_frequency = burst->center_frequency;
     int in_sample_rate = burst->sample_rate;
     /* Compute absolute timestamp: wall clock base + sample offset */
@@ -680,13 +746,13 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
         rotator_init(&r);
         float phase_inc = -2.0f * (float)M_PI * relative_freq;
         rotator_set_phase_incr(&r, cexpf(phase_inc * I));
-        rotator_rotate_n(&r, dm->work_a, dm->work_a, n);
+        rotator_rotate_n(&r, dm->work_a, burst->samples, n);
         center_frequency += relative_freq * in_sample_rate;
     }
 
-    /* Step 2: Decimate to output sample rate */
-    int dec_len = decimate_burst(dm, dm->work_a, n, dm->work_b,
-                                  in_sample_rate, &timestamp);
+    /* Step 2: Resample to output sample rate */
+    int dec_len = resample_burst(dm, dm->work_a, n, dm->work_b,
+                                 in_sample_rate, &timestamp);
     if (dec_len < 100) {
         *frames_out = NULL;
         return 0;

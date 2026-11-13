@@ -69,6 +69,51 @@ static float sincf(float x) {
     return sinf((float)M_PI * x) / ((float)M_PI * x);
 }
 
+/* ---- Kaiser low-pass ---- */
+
+static double bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0;
+    for (int k = 1; k < 50 && term > 1e-12 * sum; k++) {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+    }
+    return sum;
+}
+
+int kaiser_ntaps(double sample_rate, double transition_width, double atten_db)
+{
+    int n = (int)ceil((atten_db - 7.95) /
+                      (14.36 * transition_width / sample_rate)) + 1;
+    return (n < 3 ? 3 : n) | 1;
+}
+
+float *kaiser_lpf_taps(int ntaps, float gain, double sample_rate,
+                       double cutoff_freq, double atten_db)
+{
+    double beta = atten_db > 50 ? 0.1102 * (atten_db - 8.7)
+                : atten_db > 21 ? 0.5842 * pow(atten_db - 21, 0.4) +
+                                  0.07886 * (atten_db - 21)
+                : 0.0;
+    double fc = cutoff_freq / sample_rate;
+    double m = (ntaps - 1) / 2.0;
+    double norm = bessel_i0(beta), sum = 0;
+    float *taps = malloc(sizeof(float) * ntaps);
+    if (!taps) return NULL;
+
+    for (int i = 0; i < ntaps; i++) {
+        double n = i - m;
+        double h = fabs(n) < 1e-12 ? 2 * fc : sin(2 * M_PI * fc * n) / (M_PI * n);
+        double r = n / m;
+        double w = m > 0 ? bessel_i0(beta * sqrt(fmax(0.0, 1 - r * r))) / norm : 1;
+        taps[i] = (float)(h * w);
+        sum += taps[i];
+    }
+    for (int i = 0; i < ntaps; i++)
+        taps[i] = (float)(taps[i] * gain / sum);
+    return taps;
+}
+
 /* ---- Root Raised Cosine taps ---- */
 
 float *rrc_taps(int *ntaps_out, float gain, float sample_rate,

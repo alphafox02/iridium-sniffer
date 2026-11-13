@@ -50,6 +50,12 @@ float *rc_taps(int *ntaps_out, float sample_rate, float symbol_rate,
 float *lpf_taps(int *ntaps_out, float gain, float sample_rate,
                 float cutoff_freq, float transition_width);
 
+/* Kaiser-window low-pass: tap count for a transition width (Hz) and
+ * stopband attenuation (dB), then the taps (odd ntaps, DC gain = gain) */
+int kaiser_ntaps(double sample_rate, double transition_width, double atten_db);
+float *kaiser_lpf_taps(int ntaps, float gain, double sample_rate,
+                       double cutoff_freq, double atten_db);
+
 /* Generate a simple box/averaging filter */
 float *box_taps(int *ntaps_out, int length);
 
