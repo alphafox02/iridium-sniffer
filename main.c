@@ -587,6 +587,126 @@ typedef struct {
     ida_burst_t burst;
 } output_item_t;
 
+/* ---- Frame sorter ----
+ * Downmix workers finish out of order and can find the same burst twice.
+ * As gr-iridium's frame_sorter: hold 2 s of data time, emit in
+ * (timestamp, frequency) order, and of frames within 1 ms and 10 kHz keep
+ * the more confident. */
+
+#define SORT_HOLD_NS  2000000000ULL
+#define DEDUP_DT_NS   1000000LL
+#define DEDUP_DF_HZ   10000.0
+
+typedef struct {
+    demod_frame_t *demod;
+    int ida_ok;
+    ida_burst_t burst;
+} sorted_frame_t;
+
+static sorted_frame_t **sort_buf;
+static int sort_n, sort_cap;
+
+static void free_sorted(sorted_frame_t *sf)
+{
+    free(sf->demod->bits);
+    free(sf->demod->llr);
+    free(sf->demod);
+    free(sf);
+}
+
+static int frame_before(const demod_frame_t *a, const demod_frame_t *b)
+{
+    if (a->timestamp != b->timestamp)
+        return a->timestamp < b->timestamp;
+    return a->center_frequency < b->center_frequency;
+}
+
+/* Print, then hand off to the output thread for the slow work */
+static void emit_frame(sorted_frame_t *sf)
+{
+    demod_frame_t *demod = sf->demod;
+
+    if (parsed_mode && sf->ida_ok)
+        frame_output_print_ida(&sf->burst);
+    else
+        frame_output_print(demod);
+
+    if (web_enabled || position_enabled || gsmtap_enabled || acars_enabled) {
+        output_item_t *item = malloc(sizeof(output_item_t));
+        if (item) {
+            item->demod = *demod;   /* shallow copy */
+            item->ida_ok = sf->ida_ok;
+            item->burst = sf->burst;
+            /* bits/llr ownership moves to the output thread */
+            if (blocking_queue_add(&output_queue, item) == BQ_FULL) {
+                free(item);
+                atomic_fetch_add(&stat_n_output_drops, 1);
+            } else {
+                free(demod);
+                free(sf);
+                return;
+            }
+        }
+    }
+    free_sorted(sf);
+}
+
+static void sorter_add(sorted_frame_t *sf)
+{
+    const demod_frame_t *f = sf->demod;
+
+    int k = 0;
+    while (k < sort_n && sort_buf[k]->demod->timestamp + SORT_HOLD_NS < f->timestamp)
+        emit_frame(sort_buf[k++]);
+    if (k) {
+        memmove(sort_buf, sort_buf + k, (sort_n - k) * sizeof(*sort_buf));
+        sort_n -= k;
+    }
+
+    for (int i = 0; i < sort_n; i++) {
+        const demod_frame_t *o = sort_buf[i]->demod;
+        if (llabs((int64_t)(o->timestamp - f->timestamp)) < DEDUP_DT_NS &&
+            fabs(o->center_frequency - f->center_frequency) < DEDUP_DF_HZ) {
+            if (f->confidence <= o->confidence) {
+                free_sorted(sf);
+                return;
+            }
+            free_sorted(sort_buf[i]);
+            memmove(sort_buf + i, sort_buf + i + 1,
+                    (sort_n - i - 1) * sizeof(*sort_buf));
+            sort_n--;
+            break;
+        }
+    }
+
+    if (sort_n == sort_cap) {
+        int cap = sort_cap ? sort_cap * 2 : 256;
+        sorted_frame_t **nb = realloc(sort_buf, cap * sizeof(*nb));
+        if (!nb) {
+            emit_frame(sf);
+            return;
+        }
+        sort_buf = nb;
+        sort_cap = cap;
+    }
+    int pos = sort_n;
+    while (pos > 0 && frame_before(f, sort_buf[pos - 1]->demod))
+        pos--;
+    memmove(sort_buf + pos + 1, sort_buf + pos, (sort_n - pos) * sizeof(*sort_buf));
+    sort_buf[pos] = sf;
+    sort_n++;
+}
+
+static void sorter_flush(void)
+{
+    for (int i = 0; i < sort_n; i++)
+        emit_frame(sort_buf[i]);
+    sort_n = 0;
+    free(sort_buf);
+    sort_buf = NULL;
+    sort_cap = 0;
+}
+
 /* ---- Frame consumer: QPSK demod + IDA decode + stdout (fast path) ---- */
 
 static void *frame_consumer_thread(void *arg) {
@@ -603,41 +723,18 @@ static void *frame_consumer_thread(void *arg) {
             atomic_fetch_add(&stat_n_ok_bursts, 1);
             atomic_fetch_add(&stat_n_ok_sub, 1);
 
-            /* Try IDA decode if parsed output or GSMTAP is active */
-            int ida_ok = 0;
-            ida_burst_t burst;
-            if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled)
-                ida_ok = ida_decode(demod, &burst);
-
-            /* Output: parsed IDA line if available, otherwise RAW */
-            if (parsed_mode && ida_ok)
-                frame_output_print_ida(&burst);
-            else
-                frame_output_print(demod);
-
-            /* Hand off to output thread for slow work (web map, ACARS, GSMTAP) */
-            if (web_enabled || position_enabled || gsmtap_enabled || acars_enabled) {
-                output_item_t *item = malloc(sizeof(output_item_t));
-                if (item) {
-                    item->demod = *demod;   /* shallow copy */
-                    item->ida_ok = ida_ok;
-                    item->burst = burst;
-                    /* Transfer bits/llr ownership to output thread */
-                    if (blocking_queue_add(&output_queue, item) == BQ_FULL) {
-                        free(demod->bits);
-                        free(demod->llr);
-                        free(item);
-                        atomic_fetch_add(&stat_n_output_drops, 1);
-                    }
-                } else {
-                    free(demod->bits);
-                    free(demod->llr);
-                }
+            sorted_frame_t *sf = malloc(sizeof(*sf));
+            if (sf) {
+                sf->demod = demod;
+                sf->ida_ok = 0;
+                if (parsed_mode || gsmtap_enabled || acars_enabled || web_enabled)
+                    sf->ida_ok = ida_decode(demod, &sf->burst);
+                sorter_add(sf);
             } else {
                 free(demod->bits);
                 free(demod->llr);
+                free(demod);
             }
-            free(demod);
         } else if (verbose) {
             fprintf(stderr, "demod: UW check failed id=%lu freq=%.0f Hz dir=%s\n",
                     (unsigned long)frame->id, frame->center_frequency,
@@ -648,6 +745,7 @@ static void *frame_consumer_thread(void *arg) {
         free(frame->samples);
         free(frame);
     }
+    sorter_flush();
     return NULL;
 }
 
