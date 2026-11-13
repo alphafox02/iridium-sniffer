@@ -26,11 +26,13 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -55,13 +57,14 @@ extern int voice_enabled;
 #define MAX_AIRCRAFT     32
 #define MAX_AIRCRAFT_FIXES 8
 #define MAX_SSE_CLIENTS  8
+#define MAX_CLIENT_THREADS 64
 #define MAX_ACARS_MSGS   100
 #define ACARS_TEXT_MAX   256
-#define JSON_BUF_SIZE    131072
 #define HTTP_BUF_SIZE    4096
 
 /* ---- SSE client count ---- */
 static atomic_int sse_client_count = 0;
+static atomic_int client_threads = 0;
 
 /* ---- Shared state ---- */
 
@@ -557,25 +560,84 @@ void web_map_add_acars_message(const char *reg, const char *flight,
 
 /* ---- JSON serialization ---- */
 
-static int build_json(char *buf, int bufsize)
+/* Growable output buffer: appends never truncate or overrun */
+typedef struct {
+    char *p;
+    size_t len, cap;
+    int oom;
+} jbuf_t;
+
+static void jb_reserve(jbuf_t *j, size_t extra)
 {
+    if (j->oom || j->len + extra < j->cap) return;
+    size_t cap = j->cap ? j->cap : 65536;
+    while (cap <= j->len + extra) cap *= 2;
+    char *np = realloc(j->p, cap);
+    if (!np) { j->oom = 1; return; }
+    j->p = np;
+    j->cap = cap;
+}
+
+static void jb_printf(jbuf_t *j, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void jb_printf(jbuf_t *j, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    jb_reserve(j, (size_t)n + 1);
+    if (j->oom) return;
+    va_start(ap, fmt);
+    vsnprintf(j->p + j->len, j->cap - j->len, fmt, ap);
+    va_end(ap);
+    j->len += n;
+}
+
+/* Quoted JSON string; text decoded off the air may contain anything */
+static void jb_str(jbuf_t *j, const char *s)
+{
+    jb_reserve(j, strlen(s) * 6 + 3);
+    if (j->oom) return;
+    char *o = j->p + j->len;
+    *o++ = '"';
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            *o++ = '\\';
+            *o++ = c;
+        } else if (c < 0x20 || c >= 0x7f) {
+            o += sprintf(o, "\\u%04x", c);
+        } else {
+            *o++ = c;
+        }
+    }
+    *o++ = '"';
+    *o = '\0';
+    j->len = o - j->p;
+}
+
+static void build_json(jbuf_t *j)
+{
+    j->len = 0;
+    j->oom = 0;
     pthread_mutex_lock(&state.lock);
 
-    int off = 0;
-    off += snprintf(buf + off, bufsize - off,
+    jb_printf(j,
                     "{\"total_ira\":%lu,\"total_ibc\":%lu,\"total_pages\":%lu,"
                     "\"total_beams\":%lu,\"total_mt\":%lu,\"total_aircraft\":%lu,",
                     state.total_ira, state.total_ibc, state.total_pages,
                     state.total_beams, state.total_mt, state.total_aircraft);
 
     /* Satellite orbital positions (most recent first, max 500) */
-    off += snprintf(buf + off, bufsize - off, "\"ra\":[");
+    jb_printf(j, "\"ra\":[");
     int n_out = 0;
     for (int i = 0; i < state.ra_count && n_out < 500; i++) {
         int idx = (state.ra_head - 1 - i + MAX_RA_POINTS) % MAX_RA_POINTS;
         ra_point_t *p = &state.ra[idx];
-        if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
-        off += snprintf(buf + off, bufsize - off,
+        if (n_out > 0) jb_printf(j, ",");
+        jb_printf(j,
             "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
             "\"sat\":%d,\"beam\":%d,\"pages\":%d,"
             "\"tmsi\":%u,\"freq\":%.0f,\"t\":%llu}",
@@ -584,18 +646,17 @@ static int build_json(char *buf, int bufsize)
             p->tmsi, p->frequency,
             (unsigned long long)(p->timestamp / 1000000000ULL));
         n_out++;
-        if (off >= bufsize - 512) break;
     }
-    off += snprintf(buf + off, bufsize - off, "],");
+    jb_printf(j, "],");
 
     /* Ground beam positions (most recent first, max 300) */
-    off += snprintf(buf + off, bufsize - off, "\"beams\":[");
+    jb_printf(j, "\"beams\":[");
     n_out = 0;
     for (int i = 0; i < state.beam_count && n_out < 300; i++) {
         int idx = (state.beam_head - 1 - i + MAX_BEAM_POINTS) % MAX_BEAM_POINTS;
         beam_point_t *p = &state.beams[idx];
-        if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
-        off += snprintf(buf + off, bufsize - off,
+        if (n_out > 0) jb_printf(j, ",");
+        jb_printf(j,
             "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
             "\"sat\":%d,\"beam\":%d,\"pages\":%d,"
             "\"tmsi\":%u,\"freq\":%.0f,\"t\":%llu}",
@@ -604,27 +665,25 @@ static int build_json(char *buf, int bufsize)
             p->tmsi, p->frequency,
             (unsigned long long)(p->timestamp / 1000000000ULL));
         n_out++;
-        if (off >= bufsize - 512) break;
     }
-    off += snprintf(buf + off, bufsize - off, "],");
+    jb_printf(j, "],");
 
     /* MT phone/terminal positions (most recent first, max 200) */
-    off += snprintf(buf + off, bufsize - off, "\"mt\":[");
+    jb_printf(j, "\"mt\":[");
     n_out = 0;
     for (int i = 0; i < state.mt_count && n_out < 200; i++) {
         int idx = (state.mt_head - 1 - i + MAX_MT_POINTS) % MAX_MT_POINTS;
         mt_point_t *p = &state.mt[idx];
-        if (n_out > 0) off += snprintf(buf + off, bufsize - off, ",");
-        off += snprintf(buf + off, bufsize - off,
+        if (n_out > 0) jb_printf(j, ",");
+        jb_printf(j,
             "{\"lat\":%.4f,\"lon\":%.4f,\"alt\":%d,"
             "\"type\":%u,\"freq\":%.0f,\"t\":%llu}",
             p->lat, p->lon, p->alt,
             (unsigned)p->msg_type, p->frequency,
             (unsigned long long)(p->timestamp / 1000000000ULL));
         n_out++;
-        if (off >= bufsize - 512) break;
     }
-    off += snprintf(buf + off, bufsize - off, "],");
+    jb_printf(j, "],");
 
     /* Active satellites (only those seen in last 15 minutes) */
     uint64_t max_ts = 0;
@@ -634,95 +693,92 @@ static int build_json(char *buf, int bufsize)
     }
     uint64_t sat_window = 15ULL * 60 * 1000000000ULL;  /* 15 minutes in ns */
 
-    off += snprintf(buf + off, bufsize - off, "\"sats\":[");
+    jb_printf(j, "\"sats\":[");
     int first_sat = 1;
     for (int i = 0; i < state.n_sats; i++) {
         if (max_ts > sat_window && state.sats[i].last_seen < max_ts - sat_window)
             continue;
-        if (!first_sat) off += snprintf(buf + off, bufsize - off, ",");
-        off += snprintf(buf + off, bufsize - off,
+        if (!first_sat) jb_printf(j, ",");
+        jb_printf(j,
             "{\"id\":%d,\"beam\":%d,\"count\":%d}",
             state.sats[i].sat_id, state.sats[i].beam_id,
             state.sats[i].count);
         first_sat = 0;
     }
-    off += snprintf(buf + off, bufsize - off, "]");
+    jb_printf(j, "]");
 
     /* ACARS aircraft positions (ADS-C or beam-based) */
-    off += snprintf(buf + off, bufsize - off, ",\"aircraft\":[");
+    jb_printf(j, ",\"aircraft\":[");
     int first_ac = 1;
     for (int i = 0; i < state.n_aircraft; i++) {
         aircraft_entry_t *ac = &state.aircraft[i];
         if (ac->n_fixes == 0) continue;
-        if (!first_ac) off += snprintf(buf + off, bufsize - off, ",");
+        if (!first_ac) jb_printf(j, ",");
         first_ac = 0;
-        off += snprintf(buf + off, bufsize - off,
-            "{\"reg\":\"%s\",\"flight\":\"%s\",\"oooi\":\"%s\","
-            "\"sat\":%d,\"beam\":%d,\"freq\":%.0f,\"fixes\":[",
-            ac->reg, ac->flight, ac->oooi,
+        jb_printf(j, "{\"reg\":");
+        jb_str(j, ac->reg);
+        jb_printf(j, ",\"flight\":");
+        jb_str(j, ac->flight);
+        jb_printf(j, ",\"oooi\":");
+        jb_str(j, ac->oooi);
+        jb_printf(j, ",\"sat\":%d,\"beam\":%d,\"freq\":%.0f,\"fixes\":[",
             ac->sat_id, ac->beam_id, ac->frequency);
-        for (int j = 0; j < ac->n_fixes; j++) {
-            if (j > 0) off += snprintf(buf + off, bufsize - off, ",");
-            off += snprintf(buf + off, bufsize - off,
+        for (int f = 0; f < ac->n_fixes; f++) {
+            if (f > 0) jb_printf(j, ",");
+            jb_printf(j,
                 "{\"lat\":%.5f,\"lon\":%.5f,\"t\":%llu,\"alt\":%d,\"adsc\":%d}",
-                ac->fix_lat[j], ac->fix_lon[j],
-                (unsigned long long)ac->fix_t[j],
-                ac->fix_alt[j], (int)ac->fix_adsc[j]);
+                ac->fix_lat[f], ac->fix_lon[f],
+                (unsigned long long)ac->fix_t[f],
+                ac->fix_alt[f], (int)ac->fix_adsc[f]);
         }
-        off += snprintf(buf + off, bufsize - off, "]}");
-        if (off >= bufsize - 512) break;
+        jb_printf(j, "]}");
     }
-    off += snprintf(buf + off, bufsize - off, "]");
+    jb_printf(j, "]");
 
     /* Receiver position estimate (Doppler positioning) */
     if (state.rx_valid) {
-        off += snprintf(buf + off, bufsize - off,
+        jb_printf(j,
             ",\"rx\":{\"lat\":%.6f,\"lon\":%.6f,\"hdop\":%.1f}",
             state.rx_lat, state.rx_lon, state.rx_hdop);
     }
 
     /* Recent ACARS messages (chronological feed) */
-    off += snprintf(buf + off, bufsize - off,
+    jb_printf(j,
         ",\"total_acars_msgs\":%lu,\"acars\":[", state.total_acars_msgs);
     int n_msgs = state.acars_count;
     int n_emit = 0;
-    for (int i = n_msgs - 1; i >= 0 && off < bufsize - 1024; i--) {
+    for (int i = n_msgs - 1; i >= 0; i--) {
         int idx = (state.acars_head - 1 - (n_msgs - 1 - i) + MAX_ACARS_MSGS)
                   % MAX_ACARS_MSGS;
         const acars_msg_t *m = &state.acars[idx];
         if (n_emit > 0)
-            off += snprintf(buf + off, bufsize - off, ",");
-        char esc_text[ACARS_TEXT_MAX * 2 + 1];
-        int e = 0;
-        for (int k = 0; m->text[k] && e < (int)sizeof(esc_text) - 2; k++) {
-            char c = m->text[k];
-            if (c == '"' || c == '\\') esc_text[e++] = '\\';
-            if (c < 0x20 || c == 0x7f) c = ' ';
-            esc_text[e++] = c;
-        }
-        esc_text[e] = '\0';
-        off += snprintf(buf + off, bufsize - off,
-            "{\"t\":%llu,\"reg\":\"%s\",\"flt\":\"%s\","
-            "\"lbl\":\"%s\",\"ul\":%d,\"txt\":\"%s\"}",
-            (unsigned long long)(m->timestamp / 1000000000ULL),
-            m->reg, m->flight, m->label, m->ul, esc_text);
+            jb_printf(j, ",");
+        jb_printf(j, "{\"t\":%llu,\"reg\":",
+            (unsigned long long)(m->timestamp / 1000000000ULL));
+        jb_str(j, m->reg);
+        jb_printf(j, ",\"flt\":");
+        jb_str(j, m->flight);
+        jb_printf(j, ",\"lbl\":");
+        jb_str(j, m->label);
+        jb_printf(j, ",\"ul\":%d,\"txt\":", m->ul);
+        jb_str(j, m->text);
+        jb_printf(j, "}");
         n_emit++;
     }
-    off += snprintf(buf + off, bufsize - off, "]");
+    jb_printf(j, "]");
 
     pthread_mutex_unlock(&state.lock);
 
 #ifdef HAVE_VOICE
     /* Voice stats (uses separate lock, safe outside state.lock) */
     if (voice_enabled)
-        off += snprintf(buf + off, bufsize - off,
+        jb_printf(j,
             ",\"voice\":1,\"total_voc\":%d,\"total_voice_calls\":%d",
             voice_decode_total_frames(), voice_decode_total_calls());
 #endif
 
-    off += snprintf(buf + off, bufsize - off, "}");
+    jb_printf(j, "}");
 
-    return off;
 }
 
 /* ---- Embedded HTML/JS ---- */
@@ -978,6 +1034,11 @@ static const char HTML_PAGE[] =
 "  return h+':'+m+':'+s+'Z';\n"
 "}\n"
 "\n"
+"function esc(s){\n"
+"  return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')\n"
+"    .replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;');\n"
+"}\n"
+"\n"
 "function renderAcars(msgs){\n"
 "  var box=document.getElementById('acars-list');\n"
 "  if(!msgs||msgs.length===0){\n"
@@ -986,13 +1047,13 @@ static const char HTML_PAGE[] =
 "  }\n"
 "  var html='';\n"
 "  msgs.forEach(function(m){\n"
-"    var txt=(m.txt||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');\n"
+"    var txt=esc(m.txt);\n"
 "    html+='<div class=\"amsg\">'+\n"
 "      '<div class=\"row1\">'+\n"
 "      '<span>'+fmtTime(m.t)+'</span>'+\n"
-"      '<span class=\"reg\">'+m.reg+'</span>'+\n"
-"      (m.flt?'<span class=\"flt\">'+m.flt+'</span>':'')+\n"
-"      '<span class=\"lbl\">'+m.lbl+'</span>'+\n"
+"      '<span class=\"reg\">'+esc(m.reg)+'</span>'+\n"
+"      (m.flt?'<span class=\"flt\">'+esc(m.flt)+'</span>':'')+\n"
+"      '<span class=\"lbl\">'+esc(m.lbl)+'</span>'+\n"
 "      '<span class=\"dir\">'+(m.ul?'UL':'DL')+'</span>'+\n"
 "      '</div>'+\n"
 "      '<div class=\"txt\">'+txt+'</div></div>';\n"
@@ -1291,7 +1352,7 @@ static const char HTML_PAGE[] =
 "            {color:col,weight:2,opacity:0.5,dashArray:'6,4'}).addTo(acarsLy);\n"
 "        });\n"
 "      }\n"
-"      var label=ac.reg+(ac.flight?' / '+ac.flight:'')+(ac.oooi?' ['+ac.oooi+']':'');\n"
+"      var label=esc(ac.reg)+(ac.flight?' / '+esc(ac.flight):'')+(ac.oooi?' ['+esc(ac.oooi)+']':'');\n"
 "      var m=L.circleMarker([last.lat,last.lon],{\n"
 "        radius:7,color:col,fillColor:col,fillOpacity:0.9,weight:2\n"
 "      });\n"
@@ -1299,10 +1360,10 @@ static const char HTML_PAGE[] =
 "      var ts=new Date(last.t*1000).toUTCString().replace(/.*?([0-9]{2}:[0-9]{2}:[0-9]{2}).*/,'$1')+' UTC';\n"
 "      var altStr=last.alt>-99999?'<b>Altitude:</b> '+(last.alt).toLocaleString()+' ft<br>':'';\n"
 "      var posStr=last.adsc?'<span style=\"color:#22c55e;font-size:11px\">ADS-C GPS position</span>':'<span style=\"color:#94a3b8;font-size:11px\">~200 km beam estimate</span>';\n"
-"      var ooiStr=ac.oooi?'<b>Event:</b> <span style=\"color:#f59e0b;font-weight:600\">'+ac.oooi+'</span><br>':'';\n"
+"      var ooiStr=ac.oooi?'<b>Event:</b> <span style=\"color:#f59e0b;font-weight:600\">'+esc(ac.oooi)+'</span><br>':'';\n"
 "      m.bindPopup('<div class=\"popup-title popup-ac\" style=\"color:'+col+'\">Aircraft</div>'\n"
-"        +'<b>Reg:</b> '+ac.reg+'<br>'\n"
-"        +(ac.flight?'<b>Flight:</b> '+ac.flight+'<br>':'')\n"
+"        +'<b>Reg:</b> '+esc(ac.reg)+'<br>'\n"
+"        +(ac.flight?'<b>Flight:</b> '+esc(ac.flight)+'<br>':'')\n"
 "        +ooiStr\n"
 "        +altStr\n"
 "        +'<b>Sat:</b> '+ac.sat+'  Beam: '+ac.beam+'<br>'\n"
@@ -1428,14 +1489,14 @@ static void handle_sse(int fd)
         "\r\n");
     if (write(fd, header, hlen) < 0) return;
 
-    char *json = malloc(JSON_BUF_SIZE);
-    if (!json) return;
+    jbuf_t json = {0};
 
     while (server_running) {
         usleep(1000000);  /* 1 Hz updates */
         if (!server_running) break;
 
-        int jlen = build_json(json, JSON_BUF_SIZE - 64);
+        build_json(&json);
+        if (json.oom) break;
 
         char prefix[] = "event: update\ndata: ";
         char suffix[] = "\n\n";
@@ -1443,8 +1504,8 @@ static void handle_sse(int fd)
         struct iovec iov[3];
         iov[0].iov_base = prefix;
         iov[0].iov_len = sizeof(prefix) - 1;
-        iov[1].iov_base = json;
-        iov[1].iov_len = jlen;
+        iov[1].iov_base = json.p;
+        iov[1].iov_len = json.len;
         iov[2].iov_base = suffix;
         iov[2].iov_len = sizeof(suffix) - 1;
 
@@ -1452,23 +1513,22 @@ static void handle_sse(int fd)
         if (writev(fd, iov, 3) < 0) break;
     }
 
-    free(json);
+    free(json.p);
 }
 
-static void *client_thread(void *arg)
+static void handle_client(int fd)
 {
-    int fd = (int)(intptr_t)arg;
 
     char buf[HTTP_BUF_SIZE];
     int n = read(fd, buf, sizeof(buf) - 1);
-    if (n <= 0) { close(fd); return NULL; }
+    if (n <= 0) { close(fd); return; }
     buf[n] = '\0';
 
     /* Parse GET path */
     if (strncmp(buf, "GET ", 4) != 0) {
         send_response(fd, "405 Method Not Allowed", "text/plain", "405", 3);
         close(fd);
-        return NULL;
+        return;
     }
 
     char *path = buf + 4;
@@ -1494,12 +1554,11 @@ static void *client_thread(void *arg)
         }
         close(fd);
     } else if (strcmp(path, "/api/state") == 0) {
-        char *json = malloc(JSON_BUF_SIZE);
-        if (json) {
-            int jlen = build_json(json, JSON_BUF_SIZE);
-            send_response(fd, "200 OK", "application/json", json, jlen);
-            free(json);
-        }
+        jbuf_t json = {0};
+        build_json(&json);
+        if (!json.oom)
+            send_response(fd, "200 OK", "application/json", json.p, (int)json.len);
+        free(json.p);
         close(fd);
 #ifdef HAVE_VOICE
     } else if (voice_enabled && strcmp(path, "/api/calls") == 0) {
@@ -1596,7 +1655,12 @@ static void *client_thread(void *arg)
         send_response(fd, "404 Not Found", "text/plain", "404", 3);
         close(fd);
     }
+}
 
+static void *client_thread(void *arg)
+{
+    handle_client((int)(intptr_t)arg);
+    atomic_fetch_sub(&client_threads, 1);
     return NULL;
 }
 
@@ -1615,10 +1679,20 @@ static void *server_thread_fn(void *arg)
             continue;
         }
 
-        /* Set SO_KEEPALIVE for SSE connections */
+        if (atomic_fetch_add(&client_threads, 1) >= MAX_CLIENT_THREADS) {
+            atomic_fetch_sub(&client_threads, 1);
+            close(client);
+            continue;
+        }
+
+        /* Keepalive for SSE; timeouts so idle or non-reading clients
+         * can't hold a thread or an SSE slot forever */
         int keepalive = 1;
         setsockopt(client, SOL_SOCKET, SO_KEEPALIVE,
                     &keepalive, sizeof(keepalive));
+        struct timeval rto = { .tv_sec = 5 }, sto = { .tv_sec = 10 };
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &sto, sizeof(sto));
 
         /* Spawn client handler thread (detached) */
         pthread_t tid;
@@ -1627,6 +1701,7 @@ static void *server_thread_fn(void *arg)
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
         if (pthread_create(&tid, &attr, client_thread,
                             (void *)(intptr_t)client) != 0) {
+            atomic_fetch_sub(&client_threads, 1);
             close(client);
         }
         pthread_attr_destroy(&attr);
