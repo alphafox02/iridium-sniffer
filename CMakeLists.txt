@@ -206,6 +206,11 @@ endif()
 
 add_executable(iridium-sniffer ${SOURCES})
 
+# Doppler positioning simulator: make doppler_sim && ./doppler_sim
+add_executable(doppler_sim EXCLUDE_FROM_ALL tests/doppler_sim.c doppler_pos.c)
+target_link_libraries(doppler_sim m Threads::Threads)
+set_property(TARGET doppler_sim PROPERTY C_STANDARD 99)
+
 # Link required libraries
 target_link_libraries(iridium-sniffer PRIVATE
     Threads::Threads
