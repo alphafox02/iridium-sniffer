@@ -16,7 +16,6 @@ Native GSMTAP output (`--gsmtap`) sends decoded IDA (Iridium Data) frames direct
 - Direct iridium-toolkit RAW output, compatible with iridium-parser.py and reassembler.py
 - Built-in ACARS/SBD decoding (`--acars`) with optional libacars-2 ARINC-622/ADS-C/CPDLC support
 - Parsed IDA output mode (`--parsed`) for direct reassembler.py piping (ACARS/SBD recovery)
-- Gardner timing recovery (enabled by default) for improved weak burst demodulation
 - Native GSMTAP/LAPDm output to Wireshark (`--gsmtap`) for IDA frame analysis
 - Built-in web map with live satellite and ring alert visualization
 - Doppler-based receiver positioning from decoded satellite signals (`--position`)
@@ -963,7 +962,7 @@ Output:
                              N = flip-bits 0-7 (try --chase=5 for 31 combos)
     --save-bursts=DIR       save IQ samples of decoded bursts to directory
     --diagnostic            setup verification mode (suppresses RAW output)
-    --no-gardner            disable Gardner timing recovery (enabled by default)
+    --gardner               Gardner timing recovery in the demodulator (off by default)
     --simd=MODE             SIMD kernel selection: auto (default), avx2, sse42, neon, scalar
     --no-simd               alias for --simd=scalar
     -v, --verbose           verbose output to stderr

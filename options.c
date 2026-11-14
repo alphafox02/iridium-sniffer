@@ -217,7 +217,7 @@ static void usage(int exitcode) {
 "    --file-info=STR         file info string for output (default: auto)\n"
 "    --save-bursts=DIR       save IQ samples of decoded bursts to directory\n"
 "    --diagnostic            setup verification mode (suppresses RAW output)\n"
-"    --no-gardner           disable Gardner timing recovery (enabled by default)\n"
+"    --gardner              Gardner timing recovery in the demodulator (off by default)\n"
 "    --parsed               output parsed IDA lines (pipe to reassembler.py)\n"
 "    --acars               decode and display ACARS messages from IDA\n"
 "    --acars-json          output ACARS as JSON (compatible with acars.py)\n"
