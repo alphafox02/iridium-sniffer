@@ -28,6 +28,7 @@ simd_mag_squared_fn    simd_mag_squared    = NULL;
 simd_max_float_fn      simd_max_float      = NULL;
 simd_csquare_window_fn simd_csquare_window = NULL;
 simd_rotate_fn         simd_rotate         = generic_rotate;
+simd_fir_ccf_dec_seq_fn simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
 
 /* ---- Runtime dispatch ---- */
 
@@ -44,6 +45,7 @@ static void set_scalar(void) {
     simd_max_float      = generic_max_float;
     simd_csquare_window = generic_csquare_window;
     simd_rotate         = generic_rotate;
+    simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
     fprintf(stderr, "iridium-sniffer: using scalar kernels\n");
 }
 
@@ -61,6 +63,7 @@ static void set_neon(void) {
     simd_max_float       = neon_max_float;
     simd_csquare_window  = neon_csquare_window;
     simd_rotate          = generic_rotate;
+    simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
     fprintf(stderr, "iridium-sniffer: using NEON SIMD kernels\n");
 }
 #endif
@@ -79,6 +82,7 @@ static void set_sse42(void) {
     simd_max_float      = sse42_max_float;
     simd_csquare_window = sse42_csquare_window;
     simd_rotate         = generic_rotate;
+    simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
     fprintf(stderr, "iridium-sniffer: using SSE4.2 SIMD kernels\n");
 }
 
@@ -95,6 +99,7 @@ static void set_avx2(void) {
     simd_max_float      = avx2_max_float;
     simd_csquare_window = avx2_csquare_window;
     simd_rotate         = avx2_rotate;
+    simd_fir_ccf_dec_seq = avx2_fir_ccf_dec_seq;
     fprintf(stderr, "iridium-sniffer: using AVX2+FMA SIMD kernels\n");
 }
 
@@ -293,4 +298,21 @@ void generic_rotate(float complex *out, const float complex *in, int n,
         ph *= incr;
     }
     *phase = ph;
+}
+
+/* ---- Decimating FIR, sequential tap order ---- */
+
+void generic_fir_ccf_dec_seq(const float *taps, int ntaps,
+                             const float complex *in, float complex *out,
+                             int n_out, int dec, float *scratch) {
+    (void)scratch;
+    for (int m = 0; m < n_out; m++) {
+        const float *x = (const float *)&in[(size_t)m * dec];
+        float ar = 0, ai = 0;
+        for (int k = 0; k < ntaps; k++) {
+            ar += taps[k] * x[2 * k];
+            ai += taps[k] * x[2 * k + 1];
+        }
+        out[m] = ar + ai * I;
+    }
 }

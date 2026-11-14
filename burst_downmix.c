@@ -84,6 +84,10 @@ struct _burst_downmix {
     int rs_proto_len;
     int rs_half;                /* stage-2 half span, stage-1 samples */
     double rs_step;             /* stage-1 samples per output sample */
+    int rs_int_step;            /* rs_step when it is a whole number, else 0 */
+    float *rs_int_taps;         /* stage-2 taps for a whole-number step */
+    float *rs_scratch;          /* simd_fir_ccf_dec_seq scratch */
+    size_t rs_scratch_len;
     fir_filter_t *noise_fir;    /* noise-limiting LPF after decimation */
     fir_filter_t *start_fir;    /* magnitude smoothing */
     fir_filter_t *rrc_fir;      /* root-raised-cosine matched filter */
@@ -388,6 +392,8 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
 
     fir_filter_destroy(dm->rs_fir1);
     free(dm->rs_proto);
+    free(dm->rs_int_taps);
+    free(dm->rs_scratch);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -458,18 +464,57 @@ static void resampler_setup(burst_downmix_t *dm, int in_rate)
     if (!dm->rs_proto) errx(1, "burst_downmix: out of memory");
     dm->rs_step = fs1 / out_rate;
 
+    /* With a whole-number step (integer-MHz input rates) every output
+     * lands on phase 0 with fraction 0, so the interpolated taps below
+     * are the same for every output: precompute them once, with the same
+     * expression resample_stage2 uses */
+    free(dm->rs_int_taps);
+    dm->rs_int_taps = NULL;
+    dm->rs_int_step = 0;
+    if (dm->rs_step >= 1 && dm->rs_step <= 64 &&
+        dm->rs_step == floor(dm->rs_step)) {
+        int half = dm->rs_half, center = half * RS_PHASES;
+        float fr = 0.0f;
+        dm->rs_int_taps = malloc(sizeof(float) * 2 * half);
+        if (!dm->rs_int_taps) errx(1, "burst_downmix: out of memory");
+        const float *hp = dm->rs_proto + center + (half - 1) * RS_PHASES;
+        for (int k = 0; k < 2 * half; k++) {
+            const float *hk = hp - k * RS_PHASES;
+            dm->rs_int_taps[k] = hk[0] + fr * (hk[1] - hk[0]);
+        }
+        dm->rs_int_step = (int)dm->rs_step;
+    }
+
     if (verbose)
         fprintf(stderr, "burst_downmix: %d Hz in -> /%d (%d taps) -> %.0f Hz "
                 "(%d taps/output)\n", in_rate, dm->rs_d1,
                 dm->rs_fir1 ? dm->rs_fir1->ntaps : 0, out_rate, 2 * dm->rs_half);
 }
 
-static int resample_stage2(const burst_downmix_t *dm, const float complex *in,
+static int resample_stage2(burst_downmix_t *dm, const float complex *in,
                            int n_in, float complex *out, int max_out)
 {
     int half = dm->rs_half, center = half * RS_PHASES;
     const float *h = dm->rs_proto;
     int n_out = 0;
+
+    if (dm->rs_int_step) {
+        /* Output n reads in[1 + step * n ...] while n_in allows */
+        int step = dm->rs_int_step;
+        if (n_in <= 2 * half) return 0;
+        n_out = (n_in - 2 * half + step - 1) / step;
+        if (n_out > max_out) n_out = max_out;
+        size_t need = SIMD_DEC_SEQ_SCRATCH(2 * half, n_out, step);
+        if (need > dm->rs_scratch_len) {
+            free(dm->rs_scratch);
+            dm->rs_scratch = malloc(sizeof(float) * need);
+            if (!dm->rs_scratch) errx(1, "burst_downmix: out of memory");
+            dm->rs_scratch_len = need;
+        }
+        simd_fir_ccf_dec_seq(dm->rs_int_taps, 2 * half, in + 1, out, n_out,
+                             step, dm->rs_scratch);
+        return n_out;
+    }
 
     for (;;) {
         double t = half + n_out * dm->rs_step;

@@ -450,3 +450,58 @@ void avx2_rotate(float complex *out, const float complex *in, int n,
     }
     *phase = ph;
 }
+
+/* ---- Decimating FIR, sequential tap order ---- */
+
+/* Eight outputs per pass, one per lane, each summed over k in order with
+ * mul then add, so the result equals generic_fir_ccf_dec_seq bit for bit.
+ * The input is first split into dec polyphase planes of real and imag
+ * parts: lane j at tap k reads in[(m + j) * dec + k], which is element
+ * m + j + k / dec of plane k % dec, so the eight lanes load contiguously. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+void avx2_fir_ccf_dec_seq(const float *taps, int ntaps,
+                          const float complex *in, float complex *out,
+                          int n_out, int dec, float *scratch) {
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+    int blocks = n_out / 8;
+    if (blocks > 0) {
+        /* Plane length covers the last block's reach */
+        size_t len = (size_t)blocks * 8 + (size_t)(ntaps - 1) / dec + 1;
+        size_t n_in = (size_t)(blocks * 8 - 1) * dec + ntaps;
+        float *re = scratch, *im = scratch + (size_t)dec * len;
+        const float *x = (const float *)in;
+        for (size_t s = 0; s < n_in; s++) {
+            size_t q = s % dec, i = s / dec;
+            re[q * len + i] = x[2 * s];
+            im[q * len + i] = x[2 * s + 1];
+        }
+        for (int b = 0; b < blocks; b++) {
+            int m = b * 8;
+            __m256 ar = _mm256_setzero_ps(), ai = _mm256_setzero_ps();
+            for (int k = 0; k < ntaps; k++) {
+                size_t off = (size_t)(k % dec) * len + m + k / dec;
+                __m256 t = _mm256_set1_ps(taps[k]);
+                ar = _mm256_add_ps(ar, _mm256_mul_ps(t, _mm256_loadu_ps(re + off)));
+                ai = _mm256_add_ps(ai, _mm256_mul_ps(t, _mm256_loadu_ps(im + off)));
+            }
+            float r[8], i8[8];
+            _mm256_storeu_ps(r, ar);
+            _mm256_storeu_ps(i8, ai);
+            for (int j = 0; j < 8; j++)
+                out[m + j] = r[j] + i8[j] * I;
+        }
+    }
+    for (int m = blocks * 8; m < n_out; m++) {
+        const float *x = (const float *)&in[(size_t)m * dec];
+        float ar = 0, ai = 0;
+        for (int k = 0; k < ntaps; k++) {
+            ar += taps[k] * x[2 * k];
+            ai += taps[k] * x[2 * k + 1];
+        }
+        out[m] = ar + ai * I;
+    }
+}

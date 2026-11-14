@@ -99,6 +99,17 @@ typedef void (*simd_rotate_fn)(float complex *out, const float complex *in,
                                int n, float complex *phase,
                                float complex incr);
 
+/* Decimating complex FIR summed tap by tap in order (mul, then add; no
+ * FMA), so every implementation matches the scalar loop bit for bit:
+ * out[m] = sum over k of taps[k] * in[m * dec + k]. scratch holds at
+ * least SIMD_DEC_SEQ_SCRATCH(ntaps, n_out, dec) floats. */
+#define SIMD_DEC_SEQ_SCRATCH(ntaps, n_out, dec) \
+    (2 * ((size_t)(dec) * ((size_t)(n_out) + 1) + (size_t)(ntaps)))
+typedef void (*simd_fir_ccf_dec_seq_fn)(const float *taps, int ntaps,
+                                        const float complex *in,
+                                        float complex *out, int n_out,
+                                        int dec, float *scratch);
+
 /* ---- Global function pointers (set by simd_init) ---- */
 
 extern simd_fir_ccf_fn        simd_fir_ccf;
@@ -113,6 +124,7 @@ extern simd_mag_squared_fn    simd_mag_squared;
 extern simd_max_float_fn      simd_max_float;
 extern simd_csquare_window_fn simd_csquare_window;
 extern simd_rotate_fn         simd_rotate;
+extern simd_fir_ccf_dec_seq_fn simd_fir_ccf_dec_seq;
 
 /* ---- Initialization ---- */
 
@@ -144,6 +156,9 @@ void generic_csquare_window(const float complex *in, const float *window,
                             float complex *out, int n);
 void generic_rotate(float complex *out, const float complex *in, int n,
                     float complex *phase, float complex incr);
+void generic_fir_ccf_dec_seq(const float *taps, int ntaps,
+                             const float complex *in, float complex *out,
+                             int n_out, int dec, float *scratch);
 
 /* ---- ARM NEON implementations (AArch64 only) ---- */
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -228,6 +243,9 @@ void avx2_csquare_window(const float complex *in, const float *window,
                           float complex *out, int n);
 void avx2_rotate(float complex *out, const float complex *in, int n,
                  float complex *phase, float complex incr);
+void avx2_fir_ccf_dec_seq(const float *taps, int ntaps,
+                          const float complex *in, float complex *out,
+                          int n_out, int dec, float *scratch);
 
 #endif /* x86 */
 
