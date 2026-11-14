@@ -64,6 +64,10 @@ extern int verbose;
 #define RS_PASS_HZ          40000.0 /* kept around the burst centre */
 #define RS_ATTEN_DB         60.0
 #define RS_PHASES           64      /* stage-2 prototype points per input sample */
+/* Coarse rotation piece ahead of stage 1: 32 KB, a multiple of the
+ * rotator's 64-block renormalization period */
+#define ROT_CHUNK           (8 * 64 * ROTATOR_BLOCK)
+_Static_assert(ROT_CHUNK % (64 * ROTATOR_BLOCK) == 0, "ROT_CHUNK alignment");
 
 /* ---- Internal state ---- */
 
@@ -88,6 +92,7 @@ struct _burst_downmix {
     float *rs_int_taps;         /* stage-2 taps for a whole-number step */
     float *rs_scratch;          /* simd_fir_ccf_dec_seq scratch */
     size_t rs_scratch_len;
+    float complex *rot_buf;     /* rotated input just ahead of stage 1 */
     fir_filter_t *noise_fir;    /* noise-limiting LPF after decimation */
     fir_filter_t *start_fir;    /* magnitude smoothing */
     fir_filter_t *rrc_fir;      /* root-raised-cosine matched filter */
@@ -394,6 +399,7 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
     free(dm->rs_proto);
     free(dm->rs_int_taps);
     free(dm->rs_scratch);
+    free(dm->rot_buf);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -446,12 +452,17 @@ static void resampler_setup(burst_downmix_t *dm, int in_rate)
 
     fir_filter_destroy(dm->rs_fir1);
     dm->rs_fir1 = NULL;
+    free(dm->rot_buf);
+    dm->rot_buf = NULL;
     if (dm->rs_d1 > 1) {
         int n = kaiser_ntaps(in_rate, fs1 - 2 * RS_PASS_HZ, RS_ATTEN_DB);
         float *taps = kaiser_lpf_taps(n, 1.0f, in_rate, fs1 / 2, RS_ATTEN_DB);
         if (!taps) errx(1, "burst_downmix: out of memory");
         dm->rs_fir1 = fir_filter_create(taps, n);
         free(taps);
+        dm->rot_buf = malloc(sizeof(float complex) *
+                             (ROT_CHUNK + n + dm->rs_d1));
+        if (!dm->rot_buf) errx(1, "burst_downmix: out of memory");
     }
 
     double proto_rate = fs1 * RS_PHASES;
@@ -540,26 +551,79 @@ static int resample_stage2(burst_downmix_t *dm, const float complex *in,
     return n_out;
 }
 
-/* in is clobbered; result goes to out. timestamp moves to output sample 0. */
-static int resample_burst(burst_downmix_t *dm, float complex *in, int in_len,
+/* Coarse CFO rotation fused with the stage-1 decimating FIR. The rotated
+ * full-rate burst is never stored: the input is rotated in cache-sized
+ * pieces just ahead of the filter. Pieces are a whole number of 64-block
+ * rotator runs, so the rotator renormalizes at the same samples as one
+ * call over the whole burst, and each FIR output depends only on its own
+ * inputs, so the result matches rotate-then-filter exactly. */
+static int rotate_decimate(burst_downmix_t *dm, const float complex *in,
+                           int n, rotator_t *r, float complex *out)
+{
+    const fir_filter_t *f = dm->rs_fir1;
+    int ntaps = f->ntaps, dec = dm->rs_d1;
+    int n_out = (n - ntaps + 1) / dec;
+    if (n_out <= 0) return 0;
+
+    float complex *buf = dm->rot_buf;
+    size_t base = 0;    /* input index of buf[0] */
+    int have = 0;       /* rotated samples in buf */
+    int rotated = 0;
+    int m = 0;
+    while (m < n_out) {
+        int c = n - rotated < ROT_CHUNK ? n - rotated : ROT_CHUNK;
+        simd_rotate(buf + have, in + rotated, c, &r->phase, r->phase_incr);
+        rotated += c;
+        have += c;
+
+        /* Outputs whose taps are all rotated */
+        size_t end = base + have;
+        int m_end = end >= (size_t)ntaps
+                  ? (int)((end - ntaps) / dec) + 1 : 0;
+        if (m_end > n_out) m_end = n_out;
+        if (m_end > m) {
+            simd_fir_ccf_dec(f->taps, ntaps, buf + ((size_t)m * dec - base),
+                             out + m, m_end - m, dec);
+            m = m_end;
+        }
+
+        /* Keep what the next output still needs (under ntaps + dec) */
+        size_t drop = (size_t)m * dec - base;
+        memmove(buf, buf + drop, (have - drop) * sizeof(float complex));
+        have -= (int)drop;
+        base += drop;
+    }
+    return n_out;
+}
+
+/* Rotate by r and resample to the output rate. work is scratch the size
+ * of the input; out receives the result. timestamp moves to output
+ * sample 0. */
+static int resample_burst(burst_downmix_t *dm, const float complex *in,
+                          int in_len, rotator_t *r, float complex *work,
                           float complex *out, int in_sample_rate,
                           uint64_t *timestamp) {
     if (in_sample_rate != dm->rs_in_rate)
         resampler_setup(dm, in_sample_rate);
 
-    const float complex *s1 = in;
-    int n1 = in_len;
+    const float complex *s1;
+    int n1;
     double delay = 0;   /* input samples from in[0] to output sample 0 */
+    float complex *dst;
     if (dm->rs_d1 > 1) {
-        n1 = (in_len - dm->rs_fir1->ntaps + 1) / dm->rs_d1;
+        n1 = rotate_decimate(dm, in, in_len, r, out);
         if (n1 <= 0) return 0;
-        fir_filter_ccf_dec(dm->rs_fir1, out, in, n1, dm->rs_d1);
         s1 = out;
+        dst = work;
         delay = (dm->rs_fir1->ntaps - 1) / 2.0;
+    } else {
+        rotator_rotate_n(r, work, in, in_len);
+        s1 = work;
+        n1 = in_len;
+        dst = out;
     }
     delay += (double)dm->rs_half * dm->rs_d1;
 
-    float complex *dst = (s1 == out) ? in : out;
     int n_out = resample_stage2(dm, s1, n1, dst, dm->work_size);
     if (dst != out)
         memcpy(out, dst, n_out * sizeof(float complex));
@@ -790,21 +854,17 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     uint64_t timestamp = burst->start_time_ns +
         (uint64_t)((double)burst->info.start / in_sample_rate * 1e9);
 
-    /* Step 1: Coarse CFO correction */
+    /* Steps 1-2: coarse CFO correction and resample to the output rate */
     float relative_freq = (burst->info.center_bin - burst->fft_size / 2)
                           / (float)burst->fft_size;
-    {
-        rotator_t r;
-        rotator_init(&r);
-        float phase_inc = -2.0f * (float)M_PI * relative_freq;
-        rotator_set_phase_incr(&r, cexpf(phase_inc * I));
-        rotator_rotate_n(&r, dm->work_a, burst->samples, n);
-        center_frequency += relative_freq * in_sample_rate;
-    }
+    rotator_t coarse;
+    rotator_init(&coarse);
+    float phase_inc = -2.0f * (float)M_PI * relative_freq;
+    rotator_set_phase_incr(&coarse, cexpf(phase_inc * I));
+    center_frequency += relative_freq * in_sample_rate;
 
-    /* Step 2: Resample to output sample rate */
-    int dec_len = resample_burst(dm, dm->work_a, n, dm->work_b,
-                                 in_sample_rate, &timestamp);
+    int dec_len = resample_burst(dm, burst->samples, n, &coarse, dm->work_a,
+                                 dm->work_b, in_sample_rate, &timestamp);
     if (dec_len < 100) {
         *frames_out = NULL;
         return 0;
