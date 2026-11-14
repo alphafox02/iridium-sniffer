@@ -370,3 +370,22 @@ void sse42_csquare_window(const float complex *in, const float *window,
         outp[i * 2 + 1] = (2.0f * a * b) * window[i];
     }
 }
+
+/* ---- Threshold scan ---- */
+
+int sse42_find_above(const float *x, int n, float thr, int *idx) {
+    const __m128 t = _mm_set1_ps(thr);
+    int c = 0, i = 0;
+    for (; i + 4 <= n; i += 4) {
+        unsigned m = (unsigned)_mm_movemask_ps(
+            _mm_cmpgt_ps(_mm_loadu_ps(x + i), t));
+        while (m) {
+            idx[c++] = i + __builtin_ctz(m);
+            m &= m - 1;
+        }
+    }
+    for (; i < n; i++)
+        if (x[i] > thr)
+            idx[c++] = i;
+    return c;
+}

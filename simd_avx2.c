@@ -485,6 +485,25 @@ void avx2_rotate(float complex *out, const float complex *in, int n,
     *phase = ph;
 }
 
+/* ---- Threshold scan ---- */
+
+int avx2_find_above(const float *x, int n, float thr, int *idx) {
+    const __m256 t = _mm256_set1_ps(thr);
+    int c = 0, i = 0;
+    for (; i + 8 <= n; i += 8) {
+        unsigned m = (unsigned)_mm256_movemask_ps(
+            _mm256_cmp_ps(_mm256_loadu_ps(x + i), t, _CMP_GT_OQ));
+        while (m) {
+            idx[c++] = i + __builtin_ctz(m);
+            m &= m - 1;
+        }
+    }
+    for (; i < n; i++)
+        if (x[i] > thr)
+            idx[c++] = i;
+    return c;
+}
+
 /* ---- Decimating FIR, sequential tap order ---- */
 
 /* Eight outputs per pass, one per lane, each summed over k in order with

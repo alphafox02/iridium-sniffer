@@ -110,6 +110,7 @@ struct _burst_detector {
 
     peak_t *peaks;
     int num_peaks;
+    int *peak_idx;              /* simd_find_above output */
 
     uint64_t burst_id;
     uint64_t n_tagged_bursts;
@@ -345,6 +346,7 @@ burst_detector_t *burst_detector_create(burst_config_t *config) {
 
     /* Peak array */
     d->peaks = malloc(sizeof(peak_t) * d->fft_size);
+    d->peak_idx = malloc(sizeof(int) * d->fft_size);
     d->num_peaks = 0;
 
     /* Burst arrays (start small, grow as needed) */
@@ -422,6 +424,7 @@ void burst_detector_destroy(burst_detector_t *d) {
     free(d->burst_mask);
     free(d->ones);
     free(d->peaks);
+    free(d->peak_idx);
     free(d->bursts);
     free(d->new_bursts);
     free(d->gone_bursts);
@@ -729,14 +732,16 @@ static void extract_peaks(burst_detector_t *d) {
     int dc_bin = d->fft_size / 2;
     int dc_notch_half = 3;  /* ±3 bins around DC */
 
-    for (int bin = half_bw; bin < d->fft_size - half_bw; bin++) {
+    int lo = half_bw, hi = d->fft_size - half_bw;
+    int n = hi > lo ? simd_find_above(d->relative_magnitude + lo, hi - lo,
+                                      d->threshold, d->peak_idx) : 0;
+    for (int j = 0; j < n; j++) {
+        int bin = lo + d->peak_idx[j];
         if (bin >= dc_bin - dc_notch_half && bin <= dc_bin + dc_notch_half)
             continue;
-        if (d->relative_magnitude[bin] > d->threshold) {
-            d->peaks[d->num_peaks].bin = bin;
-            d->peaks[d->num_peaks].relative_magnitude = d->relative_magnitude[bin];
-            d->num_peaks++;
-        }
+        d->peaks[d->num_peaks].bin = bin;
+        d->peaks[d->num_peaks].relative_magnitude = d->relative_magnitude[bin];
+        d->num_peaks++;
     }
 
     /* Sort by magnitude descending */

@@ -29,6 +29,7 @@ simd_max_float_fn      simd_max_float      = NULL;
 simd_csquare_window_fn simd_csquare_window = NULL;
 simd_rotate_fn         simd_rotate         = generic_rotate;
 simd_fir_ccf_dec_seq_fn simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
+simd_find_above_fn     simd_find_above     = generic_find_above;
 
 /* ---- Runtime dispatch ---- */
 
@@ -46,6 +47,7 @@ static void set_scalar(void) {
     simd_csquare_window = generic_csquare_window;
     simd_rotate         = generic_rotate;
     simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
+    simd_find_above      = generic_find_above;
     fprintf(stderr, "iridium-sniffer: using scalar kernels\n");
 }
 
@@ -64,6 +66,7 @@ static void set_neon(void) {
     simd_csquare_window  = neon_csquare_window;
     simd_rotate          = generic_rotate;
     simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
+    simd_find_above      = generic_find_above;
     fprintf(stderr, "iridium-sniffer: using NEON SIMD kernels\n");
 }
 #endif
@@ -83,6 +86,7 @@ static void set_sse42(void) {
     simd_csquare_window = sse42_csquare_window;
     simd_rotate         = generic_rotate;
     simd_fir_ccf_dec_seq = generic_fir_ccf_dec_seq;
+    simd_find_above      = sse42_find_above;
     fprintf(stderr, "iridium-sniffer: using SSE4.2 SIMD kernels\n");
 }
 
@@ -100,6 +104,7 @@ static void set_avx2(void) {
     simd_csquare_window = avx2_csquare_window;
     simd_rotate         = avx2_rotate;
     simd_fir_ccf_dec_seq = avx2_fir_ccf_dec_seq;
+    simd_find_above      = avx2_find_above;
     fprintf(stderr, "iridium-sniffer: using AVX2+FMA SIMD kernels\n");
 }
 
@@ -298,6 +303,16 @@ void generic_rotate(float complex *out, const float complex *in, int n,
         ph *= incr;
     }
     *phase = ph;
+}
+
+/* ---- Threshold scan ---- */
+
+int generic_find_above(const float *x, int n, float thr, int *idx) {
+    int c = 0;
+    for (int i = 0; i < n; i++)
+        if (x[i] > thr)
+            idx[c++] = i;
+    return c;
 }
 
 /* ---- Decimating FIR, sequential tap order ---- */

@@ -110,6 +110,10 @@ typedef void (*simd_fir_ccf_dec_seq_fn)(const float *taps, int ntaps,
                                         float complex *out, int n_out,
                                         int dec, float *scratch);
 
+/* Indices i in [0, n) with x[i] > thr, ascending, into idx; returns the
+ * count (idx holds up to n entries) */
+typedef int (*simd_find_above_fn)(const float *x, int n, float thr, int *idx);
+
 /* ---- Global function pointers (set by simd_init) ---- */
 
 extern simd_fir_ccf_fn        simd_fir_ccf;
@@ -125,6 +129,7 @@ extern simd_max_float_fn      simd_max_float;
 extern simd_csquare_window_fn simd_csquare_window;
 extern simd_rotate_fn         simd_rotate;
 extern simd_fir_ccf_dec_seq_fn simd_fir_ccf_dec_seq;
+extern simd_find_above_fn     simd_find_above;
 
 /* ---- Initialization ---- */
 
@@ -154,6 +159,7 @@ void generic_mag_squared(const float complex *in, float *out, int n);
 float generic_max_float(const float *in, int n);
 void generic_csquare_window(const float complex *in, const float *window,
                             float complex *out, int n);
+int generic_find_above(const float *x, int n, float thr, int *idx);
 void generic_rotate(float complex *out, const float complex *in, int n,
                     float complex *phase, float complex incr);
 void generic_fir_ccf_dec_seq(const float *taps, int ntaps,
@@ -214,6 +220,7 @@ void sse42_baseline_update(float *sum, const float *old_hist,
 void sse42_relative_mag(const float *mag, const float *baseline,
                         float *out, int n);
 void sse42_convert_i8_cf(const int8_t *iq, float complex *out, size_t n);
+int sse42_find_above(const float *x, int n, float thr, int *idx);
 void sse42_mag_squared(const float complex *in, float *out, int n);
 float sse42_max_float(const float *in, int n);
 void sse42_csquare_window(const float complex *in, const float *window,
@@ -241,6 +248,7 @@ void avx2_mag_squared(const float complex *in, float *out, int n);
 float avx2_max_float(const float *in, int n);
 void avx2_csquare_window(const float complex *in, const float *window,
                           float complex *out, int n);
+int avx2_find_above(const float *x, int n, float thr, int *idx);
 void avx2_rotate(float complex *out, const float complex *in, int n,
                  float complex *phase, float complex incr);
 void avx2_fir_ccf_dec_seq(const float *taps, int ntaps,
