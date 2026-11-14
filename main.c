@@ -23,6 +23,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 
 #ifdef HAVE_HACKRF
 #include "hackrf.h"
@@ -1063,6 +1066,21 @@ static void sig_handler(int signo, siginfo_t *info, void *uctx) {
 
 /* ---- Main ---- */
 
+/* Each burst is a 1-2 MB malloc at 10 Msps, freed by a downmix worker.
+ * With glibc's dynamic thresholds the arenas trim and regrow around
+ * those blocks, so the detector thread spent most of its system time in
+ * page faults. Fixed thresholds keep the blocks on the heap and some
+ * free space at its top. A MALLOC_*_ environment setting wins. */
+static void tune_malloc(void)
+{
+#ifdef __GLIBC__
+    if (!getenv("MALLOC_MMAP_THRESHOLD_"))
+        mallopt(M_MMAP_THRESHOLD, 32 * 1024 * 1024);
+    if (!getenv("MALLOC_TRIM_THRESHOLD_"))
+        mallopt(M_TRIM_THRESHOLD, 16 * 1024 * 1024);
+#endif
+}
+
 int main(int argc, char **argv) {
     pthread_t detector, spewer, stats;
 #ifdef HAVE_HACKRF
@@ -1095,6 +1113,7 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    tune_malloc();
     parse_options(argc, argv);
 
     /* Initialize SIMD dispatch (must be before any DSP) */
