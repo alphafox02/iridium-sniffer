@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include <complex.h>
 #include <err.h>
+#include <limits.h>
 #include <math.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -94,6 +95,9 @@ struct _burst_downmix {
     size_t rs_scratch_len;
     float complex *rot_buf;     /* rotated input just ahead of stage 1 */
     float complex *gather;      /* a ROT_CHUNK piece across the ring end */
+    float complex *dec_buf;     /* decimated burst kept across its frames */
+    int frame_cap;              /* samples a frame's processing can use */
+    int dec_buf_len;
     fir_filter_t *noise_fir;    /* noise-limiting LPF after decimation */
     fir_filter_t *start_fir;    /* magnitude smoothing */
     fir_filter_t *rrc_fir;      /* root-raised-cosine matched filter */
@@ -265,8 +269,9 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
     }
 
     dm->samples_per_symbol = (float)dm->output_sample_rate / IR_SYMBOLS_PER_SECOND;
+    /* gr-iridium looks for the first frame in the first 7 ms */
     dm->search_depth = (config && config->search_depth > 0)
-        ? config->search_depth : dm->output_sample_rate;
+        ? config->search_depth : (int)(0.007 * dm->output_sample_rate);
     dm->handle_multiple_frames = config ? config->handle_multiple_frames : 0;
 
     dm->pre_start_samples = (int)(PRE_START_US * 1e-6f * dm->output_sample_rate);
@@ -347,6 +352,17 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
     int ul_sync_samples = (int)(ul_sync_symbols * dm->samples_per_symbol);
     dm->corr_fft_size = next_pow2(dm->sync_search_len + ul_sync_samples);
 
+    /* A frame's unique word lies within sync_search_len of its start and
+     * the frame runs at most IR_MAX_FRAME_LENGTH_SIMPLEX symbols from
+     * there; the matched filter reaches half its length further, and the
+     * margin covers rotator and FIR remainders. Nothing past this is
+     * used, so frame processing stops here. */
+    dm->frame_cap = dm->sync_search_len +
+        (int)(IR_MAX_FRAME_LENGTH_SIMPLEX * dm->samples_per_symbol) +
+        dm->rrc_fir->ntaps / 2 + 64;
+    if (dm->frame_cap < dm->cfo_fft_size)
+        dm->frame_cap = dm->cfo_fft_size;
+
     dm->corr_fwd_in = fftwf_alloc_complex(dm->corr_fft_size);
     dm->corr_fwd_out = fftwf_alloc_complex(dm->corr_fft_size);
     dm->corr_dl_ifft_in = fftwf_alloc_complex(dm->corr_fft_size);
@@ -404,6 +420,7 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
     free(dm->rs_scratch);
     free(dm->rot_buf);
     free(dm->gather);
+    free(dm->dec_buf);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -668,8 +685,7 @@ static int resample_burst(burst_downmix_t *dm,
 /* ---- Step 3: Find burst start ---- */
 
 static int find_burst_start(burst_downmix_t *dm, const float complex *frame,
-                             int frame_len) {
-    int search = dm->search_depth;
+                             int frame_len, int search) {
     if (search > frame_len) search = frame_len;
 
     int mag_len = search + dm->start_fir->ntaps - 1;
@@ -868,73 +884,26 @@ static int correlate_sync(burst_downmix_t *dm, const float complex *frame,
     return uw_start;
 }
 
-/* ---- Process one burst ---- */
-
-int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
-                          downmix_frame_t **frames_out) {
-    if (!burst || burst->num_samples < 100) {
-        *frames_out = NULL;
+/* ---- Steps 4-9: one frame from dec[start...] ----
+ *
+ * Fine CFO, matched filter, unique word, phase alignment and extraction
+ * for the frame at start of the decimated burst dec. Returns the samples
+ * from start that the frame covers (0 and no frame when none is found). */
+static int process_next_frame(burst_downmix_t *dm, const burst_data_t *burst,
+                              const float complex *dec, int dec_len, int start,
+                              double center_frequency, uint64_t timestamp,
+                              uint64_t id, downmix_frame_t **frame_out,
+                              int *uw_pos)
+{
+    if (start >= dec_len - 100)
         return 0;
-    }
-
-    int n = (int)burst->num_samples;
-    if (n > dm->work_size) n = dm->work_size;
-
-    double center_frequency = burst->center_frequency;
-    int in_sample_rate = burst->sample_rate;
-    /* Compute absolute timestamp: wall clock base + sample offset */
-    uint64_t timestamp = burst->start_time_ns +
-        (uint64_t)((double)burst->info.start / in_sample_rate * 1e9);
-
-    /* Steps 1-2: coarse CFO correction and resample to the output rate */
-    float relative_freq = (burst->info.center_bin - burst->fft_size / 2)
-                          / (float)burst->fft_size;
-    rotator_t coarse;
-    rotator_init(&coarse);
-    float phase_inc = -2.0f * (float)M_PI * relative_freq;
-    rotator_set_phase_incr(&coarse, cexpf(phase_inc * I));
-    center_frequency += relative_freq * in_sample_rate;
-
-    const float complex *seg[2];
-    size_t len[2];
-    burst_samples_begin(burst, seg, len);
-    int dec_len = resample_burst(dm, seg, len, n, &coarse, dm->work_a,
-                                 dm->work_b, in_sample_rate, &timestamp);
-    burst_samples_end(burst);
-    if (dec_len < 100) {
-        *frames_out = NULL;
-        return 0;
-    }
-
-    /* Step 2b: Noise-limiting LPF */
-    {
-        int nlpf_len = dec_len - dm->noise_fir->ntaps + 1;
-        if (nlpf_len > 0) {
-            int half_noise = (dm->noise_fir->ntaps - 1) / 2;
-            /* Pad for centered convolution */
-            int pad_len = dec_len + dm->noise_fir->ntaps - 1;
-            if (pad_len > dm->work_size) pad_len = dm->work_size;
-            memset(dm->work_a, 0, pad_len * sizeof(float complex));
-            memcpy(&dm->work_a[half_noise], dm->work_b,
-                   dec_len * sizeof(float complex));
-            fir_filter_ccf(dm->noise_fir, dm->work_b, dm->work_a, dec_len);
-            memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
-        } else {
-            memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
-        }
-    }
-
-    /* Step 3: Find burst start */
-    int start = find_burst_start(dm, dm->work_a, dec_len);
-    if (start >= dec_len - 100) {
-        *frames_out = NULL;
-        return 0;
-    }
 
     int frame_len = dec_len - start;
+    if (frame_len > dm->frame_cap)
+        frame_len = dm->frame_cap;
 
     /* Step 4: Fine CFO estimation */
-    float center_offset = estimate_fine_cfo(dm, &dm->work_a[start], frame_len);
+    float center_offset = estimate_fine_cfo(dm, &dec[start], frame_len);
 
     /* Step 5: Fine CFO correction */
     {
@@ -942,7 +911,7 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
         rotator_init(&r);
         float phase_inc = -2.0f * (float)M_PI * center_offset;
         rotator_set_phase_incr(&r, cexpf(phase_inc * I));
-        rotator_rotate_n(&r, dm->work_b, &dm->work_a[start], frame_len);
+        rotator_rotate_n(&r, dm->work_b, &dec[start], frame_len);
         center_frequency += center_offset * dm->output_sample_rate;
     }
 
@@ -968,10 +937,8 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
                                    &direction, &uw_start_correction,
                                    &corr_result);
 
-    if (uw_start < 0 || uw_start >= frame_len) {
-        *frames_out = NULL;
+    if (uw_start < 0 || uw_start >= frame_len)
         return 0;
-    }
 
     /* Step 8: Phase alignment */
     {
@@ -997,16 +964,14 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     }
 
     int available = frame_len - uw_start;
-    if (available < min_frame_len) {
-        *frames_out = NULL;
+    if (available < min_frame_len)
         return 0;
-    }
 
     int extract_len = available < max_frame_len ? available : max_frame_len;
 
     /* Build output frame */
     downmix_frame_t *frame = malloc(sizeof(*frame));
-    frame->id = burst->info.id;
+    frame->id = id;
     /* Timestamp the first UW symbol, as gr-iridium and the toolkit's
      * timing tools expect, not the start-finder position */
     frame->timestamp = timestamp + (uint64_t)((start + uw_start + uw_start_correction)
@@ -1022,8 +987,180 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     frame->samples = malloc(sizeof(float complex) * extract_len);
     memcpy(frame->samples, &dm->work_a[uw_start], extract_len * sizeof(float complex));
 
-    *frames_out = frame;
-    return 1;
+    *frame_out = frame;
+    *uw_pos = start + uw_start;
+    /* Samples this frame accounts for, from start */
+    return uw_start + max_frame_len < frame_len ? uw_start + max_frame_len
+                                                : frame_len;
+}
+
+#define CHAIN_FLOOR_GAIN 4.0f     /* 6 dB */
+
+/* k-th smallest of a[0..n) (reorders a) */
+static float select_kth(float *a, int n, int k)
+{
+    int lo = 0, hi = n - 1;
+    while (lo < hi) {
+        float pivot = a[(lo + hi) / 2];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (a[i] < pivot) i++;
+            while (a[j] > pivot) j--;
+            if (i <= j) {
+                float t = a[i]; a[i] = a[j]; a[j] = t;
+                i++; j--;
+            }
+        }
+        if (k <= j) hi = j;
+        else if (k >= i) lo = i;
+        else break;
+    }
+    return a[k];
+}
+
+/* Frames from dm->dec_buf in order from start, each next one right after
+ * the longest frame the previous one could have been (gr-iridium's
+ * multiple frames per burst), while the smoothed magnitude shows more
+ * than floor. The main frame, taken already from main_start over
+ * main_used samples, is skipped: by start position, or when another
+ * start finds the same unique word (within a few symbols of skip_uw). */
+static void take_frames(burst_downmix_t *dm, const burst_data_t *burst,
+                        int dec_len, int start, double center_frequency,
+                        uint64_t timestamp, int main_start, int main_used,
+                        int skip_uw, int mag_len, float floor,
+                        downmix_frame_t **frames, int *n_frames,
+                        int max_frames)
+{
+    int tol = (int)(4 * dm->samples_per_symbol);
+    while (*n_frames < max_frames) {
+        /* Starting where the main frame did: that is the main frame */
+        if (main_used > 0 && abs(start - main_start) <= tol) {
+            start = main_start + main_used;
+            main_used = 0;
+            continue;
+        }
+        /* Stop where nothing rises above the noise floor */
+        int w = start < mag_len ? mag_len - start : 0;
+        if (w > dm->sync_search_len) w = dm->sync_search_len;
+        if (w <= 0 || simd_max_float(dm->mag_filtered_f + start, w) < floor)
+            break;
+        downmix_frame_t *frame = NULL;
+        int uw_pos = 0;
+        int used = process_next_frame(dm, burst, dm->dec_buf, dec_len, start,
+                                      center_frequency, timestamp,
+                                      burst->info.id + *n_frames, &frame,
+                                      &uw_pos);
+        if (!frame)
+            break;
+        if (abs(uw_pos - skip_uw) <= tol) {
+            free(frame->samples);
+            free(frame);
+        } else {
+            frames[(*n_frames)++] = frame;
+        }
+        if (used <= 0)
+            break;
+        start += used;
+    }
+}
+
+/* ---- Process one burst ---- */
+
+int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
+                          downmix_frame_t **frames_out, int max_frames) {
+    if (!burst || burst->num_samples < 100)
+        return 0;
+
+    int n = (int)burst->num_samples;
+    if (n > dm->work_size) n = dm->work_size;
+
+    double center_frequency = burst->center_frequency;
+    int in_sample_rate = burst->sample_rate;
+    /* Compute absolute timestamp: wall clock base + sample offset */
+    uint64_t timestamp = burst->start_time_ns +
+        (uint64_t)((double)burst->info.start / in_sample_rate * 1e9);
+
+    /* Steps 1-2: coarse CFO correction and resample to the output rate */
+    float relative_freq = (burst->info.center_bin - burst->fft_size / 2)
+                          / (float)burst->fft_size;
+    rotator_t coarse;
+    rotator_init(&coarse);
+    float phase_inc = -2.0f * (float)M_PI * relative_freq;
+    rotator_set_phase_incr(&coarse, cexpf(phase_inc * I));
+    center_frequency += relative_freq * in_sample_rate;
+
+    const float complex *seg[2];
+    size_t len[2];
+    burst_samples_begin(burst, seg, len);
+    int dec_len = resample_burst(dm, seg, len, n, &coarse, dm->work_a,
+                                 dm->work_b, in_sample_rate, &timestamp);
+    burst_samples_end(burst);
+    if (dec_len < 100)
+        return 0;
+
+    /* Step 2b: Noise-limiting LPF */
+    {
+        int nlpf_len = dec_len - dm->noise_fir->ntaps + 1;
+        if (nlpf_len > 0) {
+            int half_noise = (dm->noise_fir->ntaps - 1) / 2;
+            /* Pad for centered convolution */
+            int pad_len = dec_len + dm->noise_fir->ntaps - 1;
+            if (pad_len > dm->work_size) pad_len = dm->work_size;
+            memset(dm->work_a, 0, pad_len * sizeof(float complex));
+            memcpy(&dm->work_a[half_noise], dm->work_b,
+                   dec_len * sizeof(float complex));
+            fir_filter_ccf(dm->noise_fir, dm->work_b, dm->work_a, dec_len);
+            memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
+        } else {
+            memcpy(dm->work_a, dm->work_b, dec_len * sizeof(float complex));
+        }
+    }
+
+    /* Keep the decimated burst: each frame's processing reuses work_a/b */
+    if (dec_len > dm->dec_buf_len) {
+        free(dm->dec_buf);
+        dm->dec_buf = malloc(sizeof(float complex) * dec_len);
+        if (!dm->dec_buf) errx(1, "burst_downmix: out of memory");
+        dm->dec_buf_len = dec_len;
+    }
+    memcpy(dm->dec_buf, dm->work_a, dec_len * sizeof(float complex));
+
+    /* Step 3: the frame at the start of the strongest part of the burst
+     * (first crossing of START_THRESHOLD of its peak). With multiple
+     * frames, first look for the first frame in the first search_depth
+     * samples, as gr-iridium; the whole-burst search runs last so the
+     * smoothed magnitude of the whole burst is left in mag_filtered_f. */
+    int first = dm->handle_multiple_frames
+              ? find_burst_start(dm, dm->dec_buf, dec_len, dm->search_depth)
+              : 0;
+    int start = find_burst_start(dm, dm->dec_buf, dec_len, dec_len);
+
+    int n_frames = 0;
+    int main_uw = INT_MIN / 2;
+    downmix_frame_t *frame = NULL;
+    int main_used = process_next_frame(dm, burst, dm->dec_buf, dec_len, start,
+                                       center_frequency, timestamp,
+                                       burst->info.id, &frame, &main_uw);
+    if (frame)
+        frames_out[n_frames++] = frame;
+
+    /* Back-to-back frames on one channel arrive as one burst, and a weaker
+     * frame ahead of the strongest is missed above: take frames in order
+     * from the first one too, down to the noise floor (6 dB over the 20th
+     * percentile of the smoothed magnitude) */
+    if (dm->handle_multiple_frames) {
+        int mag_len = dec_len - dm->start_fir->ntaps + 1;
+        float floor = 0;
+        if (mag_len > 0) {
+            memcpy(dm->mag_f, dm->mag_filtered_f, sizeof(float) * mag_len);
+            floor = CHAIN_FLOOR_GAIN *
+                    select_kth(dm->mag_f, mag_len, mag_len / 5);
+        }
+        take_frames(dm, burst, dec_len, first, center_frequency, timestamp,
+                    start, frame ? main_used : 0, main_uw, mag_len, floor,
+                    frames_out, &n_frames, max_frames);
+    }
+    return n_frames;
 }
 
 /* ---- Thread function ---- */
@@ -1036,18 +1173,15 @@ void *burst_downmix_thread(void *arg) {
         if (blocking_queue_take(&burst_queue, &burst) != 0)
             break;
 
-        downmix_frame_t *frames = NULL;
-        int n_frames = burst_downmix_process(dm, burst, &frames);
-
-        if (n_frames > 0 && frames) {
-            /* Push frame to queue (process returns a single malloc'd frame) */
-            if (blocking_queue_add(&frame_queue, frames) == BQ_FULL) {
-                free(frames->samples);
-                free(frames);
+        downmix_frame_t *frames[DOWNMIX_MAX_FRAMES];
+        int n_frames = burst_downmix_process(dm, burst, frames,
+                                             DOWNMIX_MAX_FRAMES);
+        for (int i = 0; i < n_frames; i++) {
+            if (blocking_queue_add(&frame_queue, frames[i]) == BQ_FULL) {
+                free(frames[i]->samples);
+                free(frames[i]);
                 atomic_fetch_add(&stat_n_frame_drops, 1);
             }
-        } else {
-            free(frames);
         }
 
         burst_release(burst);

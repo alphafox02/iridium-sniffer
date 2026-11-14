@@ -56,18 +56,22 @@ typedef struct _burst_downmix burst_downmix_t;
 /* Configuration */
 typedef struct {
     int output_sample_rate;     /* 0 = auto (based on sps * symbol_rate) */
-    int search_depth;           /* max samples to search for burst start */
+    int search_depth;           /* first-frame search with multiple frames,
+                                   output samples (0 = 7 ms) */
     int handle_multiple_frames; /* allow multiple frames per burst */
 } downmix_config_t;
 
 /* Create a downmix context */
 burst_downmix_t *burst_downmix_create(downmix_config_t *config);
 
-/* Process one burst, returns array of frames (may be >1 if multi-frame).
- * Caller owns returned frames and must free samples and frame array.
- * Returns number of frames (0 if burst could not be processed). */
+/* Most frames taken from one burst */
+#define DOWNMIX_MAX_FRAMES 8
+
+/* Process one burst into up to max_frames frames (more than one only with
+ * handle_multiple_frames). Each frame is malloc'd, as are its samples;
+ * the caller frees both. Returns the number of frames. */
 int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
-                          downmix_frame_t **frames_out);
+                          downmix_frame_t **frames_out, int max_frames);
 
 /* Destroy */
 void burst_downmix_destroy(burst_downmix_t *dm);

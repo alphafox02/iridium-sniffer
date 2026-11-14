@@ -1306,6 +1306,7 @@ int main(int argc, char **argv) {
     burst_downmix_t *dm[num_downmix_workers];
     for (int i = 0; i < num_downmix_workers; i++) {
         downmix_config_t dm_config = { 0 };
+        dm_config.handle_multiple_frames = 1;   /* as gr-iridium */
         dm[i] = burst_downmix_create(&dm_config);
     }
 
