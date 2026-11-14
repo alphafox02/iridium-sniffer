@@ -386,3 +386,67 @@ void avx2_csquare_window(const float complex *in, const float *window,
         outp[i * 2 + 1] = (2.0f * a * b) * window[i];
     }
 }
+
+/* ---- Frequency rotation ---- */
+
+/* Same operations in the same order as generic_rotate (mul then
+ * add/sub, no FMA), so the output is bit-identical. Eight samples per
+ * block: two vectors of four interleaved complex values. Contraction is
+ * off for this function: under LTO, GCC otherwise fuses the scalar phase
+ * updates into FMAs even with -std=c99. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("fp-contract=off")))
+#endif
+void avx2_rotate(float complex *out, const float complex *in, int n,
+                 float complex *phase, float complex incr) {
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+    float s[2 * ROTATOR_BLOCK];
+    float complex p = 1.0f;
+    for (int k = 0; k < ROTATOR_BLOCK; k++) {
+        s[2 * k] = crealf(p);
+        s[2 * k + 1] = cimagf(p);
+        p *= incr;
+    }
+    float complex block_incr = p;
+    float complex ph = *phase;
+
+    const __m256 s0 = _mm256_loadu_ps(s);
+    const __m256 s1 = _mm256_loadu_ps(s + 8);
+    const __m256 s0x = _mm256_permute_ps(s0, 0xB1);
+    const __m256 s1x = _mm256_permute_ps(s1, 0xB1);
+
+    const float *x = (const float *)in;
+    float *y = (float *)out;
+    int i = 0;
+    for (; i + ROTATOR_BLOCK <= n; i += ROTATOR_BLOCK) {
+        __m256 pr = _mm256_set1_ps(crealf(ph));
+        __m256 pi = _mm256_set1_ps(cimagf(ph));
+        /* w = phase * step: (pr*sr - pi*si, pr*si + pi*sr) */
+        __m256 w0 = _mm256_addsub_ps(_mm256_mul_ps(pr, s0), _mm256_mul_ps(pi, s0x));
+        __m256 w1 = _mm256_addsub_ps(_mm256_mul_ps(pr, s1), _mm256_mul_ps(pi, s1x));
+        __m256 x0 = _mm256_loadu_ps(x + 2 * i);
+        __m256 x1 = _mm256_loadu_ps(x + 2 * i + 8);
+        /* y = x * w: (xr*wr - xi*wi, xr*wi + xi*wr) */
+        __m256 y0 = _mm256_addsub_ps(
+            _mm256_mul_ps(_mm256_moveldup_ps(x0), w0),
+            _mm256_mul_ps(_mm256_movehdup_ps(x0), _mm256_permute_ps(w0, 0xB1)));
+        __m256 y1 = _mm256_addsub_ps(
+            _mm256_mul_ps(_mm256_moveldup_ps(x1), w1),
+            _mm256_mul_ps(_mm256_movehdup_ps(x1), _mm256_permute_ps(w1, 0xB1)));
+        _mm256_storeu_ps(y + 2 * i, y0);
+        _mm256_storeu_ps(y + 2 * i + 8, y1);
+
+        ph *= block_incr;
+        if ((i & (64 * ROTATOR_BLOCK - 1)) == 0) {
+            float m2 = crealf(ph) * crealf(ph) + cimagf(ph) * cimagf(ph);
+            ph *= 0.5f * (3.0f - m2);
+        }
+    }
+    for (; i < n; i++) {
+        out[i] = in[i] * ph;
+        ph *= incr;
+    }
+    *phase = ph;
+}

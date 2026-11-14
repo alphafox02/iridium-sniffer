@@ -90,6 +90,15 @@ typedef void (*simd_csquare_window_fn)(const float complex *in,
                                         const float *window,
                                         float complex *out, int n);
 
+/* Frequency rotation: out[i] = in[i] * phase; phase *= incr after each
+ * sample (*phase is updated). Works in blocks of ROTATOR_BLOCK with
+ * precomputed steps; every implementation must match generic_rotate
+ * bit for bit, so no FMA contraction. */
+#define ROTATOR_BLOCK 8
+typedef void (*simd_rotate_fn)(float complex *out, const float complex *in,
+                               int n, float complex *phase,
+                               float complex incr);
+
 /* ---- Global function pointers (set by simd_init) ---- */
 
 extern simd_fir_ccf_fn        simd_fir_ccf;
@@ -103,6 +112,7 @@ extern simd_convert_i8_cf_fn  simd_convert_i8_cf;
 extern simd_mag_squared_fn    simd_mag_squared;
 extern simd_max_float_fn      simd_max_float;
 extern simd_csquare_window_fn simd_csquare_window;
+extern simd_rotate_fn         simd_rotate;
 
 /* ---- Initialization ---- */
 
@@ -132,6 +142,8 @@ void generic_mag_squared(const float complex *in, float *out, int n);
 float generic_max_float(const float *in, int n);
 void generic_csquare_window(const float complex *in, const float *window,
                             float complex *out, int n);
+void generic_rotate(float complex *out, const float complex *in, int n,
+                    float complex *phase, float complex incr);
 
 /* ---- ARM NEON implementations (AArch64 only) ---- */
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -214,6 +226,8 @@ void avx2_mag_squared(const float complex *in, float *out, int n);
 float avx2_max_float(const float *in, int n);
 void avx2_csquare_window(const float complex *in, const float *window,
                           float complex *out, int n);
+void avx2_rotate(float complex *out, const float complex *in, int n,
+                 float complex *phase, float complex incr);
 
 #endif /* x86 */
 

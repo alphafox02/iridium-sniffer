@@ -27,6 +27,7 @@ simd_convert_i8_cf_fn  simd_convert_i8_cf  = NULL;
 simd_mag_squared_fn    simd_mag_squared    = NULL;
 simd_max_float_fn      simd_max_float      = NULL;
 simd_csquare_window_fn simd_csquare_window = NULL;
+simd_rotate_fn         simd_rotate         = generic_rotate;
 
 /* ---- Runtime dispatch ---- */
 
@@ -42,6 +43,7 @@ static void set_scalar(void) {
     simd_mag_squared    = generic_mag_squared;
     simd_max_float      = generic_max_float;
     simd_csquare_window = generic_csquare_window;
+    simd_rotate         = generic_rotate;
     fprintf(stderr, "iridium-sniffer: using scalar kernels\n");
 }
 
@@ -58,6 +60,7 @@ static void set_neon(void) {
     simd_mag_squared     = neon_mag_squared;
     simd_max_float       = neon_max_float;
     simd_csquare_window  = neon_csquare_window;
+    simd_rotate          = generic_rotate;
     fprintf(stderr, "iridium-sniffer: using NEON SIMD kernels\n");
 }
 #endif
@@ -75,6 +78,7 @@ static void set_sse42(void) {
     simd_mag_squared    = sse42_mag_squared;
     simd_max_float      = sse42_max_float;
     simd_csquare_window = sse42_csquare_window;
+    simd_rotate         = generic_rotate;
     fprintf(stderr, "iridium-sniffer: using SSE4.2 SIMD kernels\n");
 }
 
@@ -90,6 +94,7 @@ static void set_avx2(void) {
     simd_mag_squared    = avx2_mag_squared;
     simd_max_float      = avx2_max_float;
     simd_csquare_window = avx2_csquare_window;
+    simd_rotate         = avx2_rotate;
     fprintf(stderr, "iridium-sniffer: using AVX2+FMA SIMD kernels\n");
 }
 
@@ -246,4 +251,46 @@ void generic_csquare_window(const float complex *in, const float *window,
         float complex s = in[i];
         out[i] = s * s * window[i];
     }
+}
+
+/* ---- Frequency rotation ---- */
+
+/* Blocks of ROTATOR_BLOCK with precomputed steps break the serial phase
+ * dependency; the phase is renormalized every 64 blocks. */
+void generic_rotate(float complex *out, const float complex *in, int n,
+                    float complex *phase, float complex incr) {
+    float sr[ROTATOR_BLOCK], si[ROTATOR_BLOCK];
+    float complex p = 1.0f;
+    for (int k = 0; k < ROTATOR_BLOCK; k++) {
+        sr[k] = crealf(p);
+        si[k] = cimagf(p);
+        p *= incr;
+    }
+    float complex block_incr = p;
+    float complex ph = *phase;
+
+    const float *x = (const float *)in;
+    float *y = (float *)out;
+    int i = 0;
+    for (; i + ROTATOR_BLOCK <= n; i += ROTATOR_BLOCK) {
+        float pr = crealf(ph), pi = cimagf(ph);
+        for (int k = 0; k < ROTATOR_BLOCK; k++) {
+            float wr = pr * sr[k] - pi * si[k];
+            float wi = pr * si[k] + pi * sr[k];
+            float xr = x[2 * (i + k)], xi = x[2 * (i + k) + 1];
+            y[2 * (i + k)] = xr * wr - xi * wi;
+            y[2 * (i + k) + 1] = xr * wi + xi * wr;
+        }
+        ph *= block_incr;
+        if ((i & (64 * ROTATOR_BLOCK - 1)) == 0) {
+            /* |phase| stays near 1: one Newton step for 1/|phase| */
+            float m2 = crealf(ph) * crealf(ph) + cimagf(ph) * cimagf(ph);
+            ph *= 0.5f * (3.0f - m2);
+        }
+    }
+    for (; i < n; i++) {
+        out[i] = in[i] * ph;
+        ph *= incr;
+    }
+    *phase = ph;
 }
