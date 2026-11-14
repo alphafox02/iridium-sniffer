@@ -749,6 +749,7 @@ static void *frame_consumer_thread(void *arg) {
         free(frame);
     }
     sorter_flush();
+    qpsk_demod_thread_cleanup();
     return NULL;
 }
 

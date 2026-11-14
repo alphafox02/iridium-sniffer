@@ -41,6 +41,9 @@ typedef struct {
  * Caller owns returned frame and must free bits and frame. */
 int qpsk_demod(downmix_frame_t *in, demod_frame_t **out);
 
+/* Free the calling thread's demod work buffers (call before it exits) */
+void qpsk_demod_thread_cleanup(void);
+
 /* Thread function: pulls from frame_queue, pushes to output_queue */
 void *qpsk_demod_thread(void *arg);
 

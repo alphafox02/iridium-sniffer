@@ -77,6 +77,16 @@ static int ensure_work_buffers(int max_symbols) {
     return 1;
 }
 
+void qpsk_demod_thread_cleanup(void) {
+    free(work_decimated);   work_decimated = NULL;
+    free(work_pll_out);     work_pll_out = NULL;
+    free(work_symbols);     work_symbols = NULL;
+    free(work_offsets);     work_offsets = NULL;
+    free(work_magnitudes);  work_magnitudes = NULL;
+    free(work_cum_phase);   work_cum_phase = NULL;
+    work_capacity = 0;
+}
+
 /* Gardner TED loop filter gains.
  * Bn*Ts ~= 0.01 (1% of symbol rate) for moderate convergence speed.
  * Kp (proportional) and Ki (integral) derived from standard 2nd-order loop. */
