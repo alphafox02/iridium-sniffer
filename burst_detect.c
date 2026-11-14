@@ -125,10 +125,6 @@ struct _burst_detector {
     size_t ringbuf_write;       /* write position (mod ringbuf_size) */
     uint64_t ringbuf_start;     /* absolute sample index of oldest sample */
 
-    /* int8 -> float complex conversion buffer */
-    float complex *convert_buf;
-    size_t convert_buf_size;
-
     /* Timestamp */
     uint64_t start_time_ns;     /* nanosecond timestamp at sample 0 */
     uint64_t pending_hw_ts;     /* hardware timestamp for next feed (0=none) */
@@ -421,7 +417,6 @@ void burst_detector_destroy(burst_detector_t *d) {
     free(d->new_bursts);
     free(d->gone_bursts);
     free(d->ringbuf);
-    free(d->convert_buf);
     fprintf(stderr, "burst_detect: tagged %lu bursts total\n",
             (unsigned long)d->n_tagged_bursts);
     free(d);
@@ -462,23 +457,32 @@ float burst_detector_peak_signal(burst_detector_t *d) {
 
 /* ---- Internal: ringbuffer operations ---- */
 
-static void ringbuf_write(burst_detector_t *d, const float complex *samples, size_t n) {
-    size_t pos = d->ringbuf_write;
-    if (pos + n <= d->ringbuf_size) {
-        memcpy(&d->ringbuf[pos], samples, n * sizeof(float complex));
-        d->ringbuf_write = pos + n;
-        if (d->ringbuf_write == d->ringbuf_size)
-            d->ringbuf_write = 0;
-    } else {
-        size_t first = d->ringbuf_size - pos;
-        memcpy(&d->ringbuf[pos], samples, first * sizeof(float complex));
-        memcpy(d->ringbuf, samples + first, (n - first) * sizeof(float complex));
-        d->ringbuf_write = n - first;
-    }
+/* Move the write position past n samples just stored at it */
+static void ringbuf_advance(burst_detector_t *d, size_t n) {
+    d->ringbuf_write = (d->ringbuf_write + n) % d->ringbuf_size;
     /* Oldest available sample index once this block is counted */
     uint64_t total_written = d->sample_count + n;
     if (total_written > d->ringbuf_size)
         d->ringbuf_start = total_written - d->ringbuf_size;
+}
+
+/* n must not exceed the ring size (callers feed in chunks) */
+static void ringbuf_write(burst_detector_t *d, const float complex *samples, size_t n) {
+    size_t pos = d->ringbuf_write;
+    size_t first = n <= d->ringbuf_size - pos ? n : d->ringbuf_size - pos;
+    memcpy(&d->ringbuf[pos], samples, first * sizeof(float complex));
+    memcpy(d->ringbuf, samples + first, (n - first) * sizeof(float complex));
+    ringbuf_advance(d, n);
+}
+
+/* int8 IQ pairs converted straight into the ring */
+static void ringbuf_write_i8(burst_detector_t *d, const int8_t *iq, size_t n) {
+    size_t pos = d->ringbuf_write;
+    size_t first = n <= d->ringbuf_size - pos ? n : d->ringbuf_size - pos;
+    simd_convert_i8_cf(iq, &d->ringbuf[pos], first);
+    if (n > first)
+        simd_convert_i8_cf(iq + 2 * first, d->ringbuf, n - first);
+    ringbuf_advance(d, n);
 }
 
 static float complex *ringbuf_extract(burst_detector_t *d, uint64_t start,
@@ -867,19 +871,8 @@ static void feed_block_i8(burst_detector_t *d, const int8_t *iq,
 
     update_time_anchor(d, num_samples);
 
-    /* Convert int8 to float complex and write to ringbuffer */
-
-    if (num_samples > d->convert_buf_size) {
-        free(d->convert_buf);
-        d->convert_buf_size = num_samples;
-        d->convert_buf = aligned_alloc_32(sizeof(float complex) * d->convert_buf_size);
-    }
-
-    /* int8 IQ -> float complex (SIMD-accelerated) */
-    simd_convert_i8_cf(iq, d->convert_buf, num_samples);
-
-    /* Write to ringbuffer */
-    ringbuf_write(d, d->convert_buf, num_samples);
+    /* int8 IQ -> float complex, straight into the ring */
+    ringbuf_write_i8(d, iq, num_samples);
     d->sample_count += num_samples;
 
     /* Process complete FFT frames */
@@ -953,17 +946,8 @@ static void feed_block_cf32(burst_detector_t *d, const float *iq,
                             size_t num_samples, burst_callback_t cb, void *user) {
     update_time_anchor(d, num_samples);
 
-    /* Convert interleaved float pairs to float complex and write to ringbuffer */
-    if (num_samples > d->convert_buf_size) {
-        free(d->convert_buf);
-        d->convert_buf_size = num_samples;
-        d->convert_buf = malloc(sizeof(float complex) * d->convert_buf_size);
-    }
-
-    memcpy(d->convert_buf, iq, sizeof(float complex) * num_samples);
-
-    /* Write to ringbuffer */
-    ringbuf_write(d, d->convert_buf, num_samples);
+    /* Interleaved float pairs have the layout of float complex */
+    ringbuf_write(d, (const float complex *)iq, num_samples);
     d->sample_count += num_samples;
 
     /* Process complete FFT frames (identical to int8 path) */
