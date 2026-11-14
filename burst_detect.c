@@ -13,6 +13,7 @@
 #include <complex.h>
 #include <err.h>
 #include <math.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -125,6 +126,12 @@ struct _burst_detector {
     size_t ringbuf_write;       /* write position (mod ringbuf_size) */
     uint64_t ringbuf_start;     /* absolute sample index of oldest sample */
 
+    /* Emitted bursts that may still read from the ring */
+    burst_data_t **pending;
+    int n_pending;
+    int pending_cap;
+    uint64_t n_ring_copies;     /* bursts copied out before an overwrite */
+
     /* Timestamp */
     uint64_t start_time_ns;     /* nanosecond timestamp at sample 0 */
     uint64_t pending_hw_ts;     /* hardware timestamp for next feed (0=none) */
@@ -150,6 +157,8 @@ extern volatile sig_atomic_t running;
 extern int verbose;
 extern atomic_ullong stat_n_detected;
 extern atomic_ullong stat_n_dropped;
+
+static void ring_protect(burst_detector_t *d, uint64_t keep);
 
 /* ---- Helper: dynamic array push ---- */
 
@@ -416,9 +425,15 @@ void burst_detector_destroy(burst_detector_t *d) {
     free(d->bursts);
     free(d->new_bursts);
     free(d->gone_bursts);
+    /* Bursts still queued or in progress move off the ring first */
+    ring_protect(d, UINT64_MAX);
+    free(d->pending);
     free(d->ringbuf);
     fprintf(stderr, "burst_detect: tagged %lu bursts total\n",
             (unsigned long)d->n_tagged_bursts);
+    if (verbose)
+        fprintf(stderr, "burst_detect: %lu bursts copied out of the ring "
+                "before overwrite\n", (unsigned long)d->n_ring_copies);
     free(d);
 }
 
@@ -455,7 +470,118 @@ float burst_detector_peak_signal(burst_detector_t *d) {
     return d->peak_signal_db;
 }
 
+/* ---- Burst sample sharing ---- */
+
+/* A burst points into the ring instead of carrying a copy. The consumer
+ * claims it (RING -> READING) before reading and marks it DONE after;
+ * before the ring overwrites a burst's samples the detector copies them
+ * out (RING -> COPIED), or waits for a read already under way to end.
+ * The detector holds one reference while a burst may use the ring and
+ * the consumer holds the other. */
+enum { BS_RING, BS_READING, BS_COPIED, BS_DONE };
+
+static void burst_unref(burst_data_t *b)
+{
+    if (atomic_fetch_sub_explicit(&b->refs, 1, memory_order_acq_rel) == 1) {
+        free(b->copy);
+        free(b);
+    }
+}
+
+void burst_samples_begin(burst_data_t *b, const float complex *seg[2],
+                         size_t len[2])
+{
+    int s = BS_RING;
+    if (atomic_compare_exchange_strong_explicit(&b->state, &s, BS_READING,
+            memory_order_acquire, memory_order_acquire)) {
+        seg[0] = b->seg[0]; len[0] = b->seg_len[0];
+        seg[1] = b->seg[1]; len[1] = b->seg_len[1];
+    } else {
+        seg[0] = b->copy; len[0] = b->num_samples;
+        seg[1] = NULL; len[1] = 0;
+    }
+}
+
+void burst_samples_end(burst_data_t *b)
+{
+    int s = BS_READING;
+    atomic_compare_exchange_strong_explicit(&b->state, &s, BS_DONE,
+            memory_order_release, memory_order_relaxed);
+}
+
+void burst_release(burst_data_t *b)
+{
+    burst_samples_end(b);
+    burst_unref(b);
+}
+
+/* Take b off the ring: copy it out unless a read is already under way,
+ * in which case wait for that read to end */
+static void ring_detach(burst_detector_t *d, burst_data_t *b)
+{
+    int s = atomic_load_explicit(&b->state, memory_order_acquire);
+    if (s == BS_RING) {
+        float complex *c = malloc(sizeof(float complex) * b->num_samples);
+        if (!c) errx(1, "burst_detect: out of memory");
+        memcpy(c, b->seg[0], b->seg_len[0] * sizeof(float complex));
+        memcpy(c + b->seg_len[0], b->seg[1],
+               b->seg_len[1] * sizeof(float complex));
+        b->copy = c;
+        if (atomic_compare_exchange_strong_explicit(&b->state, &s, BS_COPIED,
+                memory_order_acq_rel, memory_order_acquire)) {
+            d->n_ring_copies++;
+            return;
+        }
+        /* Claimed meanwhile: the reader uses the ring, not the copy */
+        b->copy = NULL;
+        free(c);
+    }
+    while (s == BS_READING) {
+        sched_yield();
+        s = atomic_load_explicit(&b->state, memory_order_acquire);
+    }
+}
+
+/* Called before the ring overwrites samples below absolute index keep */
+static void ring_protect(burst_detector_t *d, uint64_t keep)
+{
+    int j = 0;
+    for (int i = 0; i < d->n_pending; i++) {
+        burst_data_t *b = d->pending[i];
+        int s = atomic_load_explicit(&b->state, memory_order_acquire);
+        int refs = atomic_load_explicit(&b->refs, memory_order_acquire);
+        if (s == BS_DONE || refs == 1) {
+            burst_unref(b);             /* finished with the ring */
+        } else if (b->data_start < keep) {
+            ring_detach(d, b);
+            burst_unref(b);
+        } else {
+            d->pending[j++] = b;
+        }
+    }
+    d->n_pending = j;
+}
+
+static void pending_add(burst_detector_t *d, burst_data_t *b)
+{
+    if (d->n_pending >= d->pending_cap) {
+        int cap = d->pending_cap ? d->pending_cap * 2 : 64;
+        burst_data_t **p = realloc(d->pending, sizeof(*p) * cap);
+        if (!p) errx(1, "burst_detect: out of memory");
+        d->pending = p;
+        d->pending_cap = cap;
+    }
+    d->pending[d->n_pending++] = b;
+}
+
 /* ---- Internal: ringbuffer operations ---- */
+
+/* Before n samples are written at the write position */
+static void ringbuf_reserve(burst_detector_t *d, size_t n) {
+    uint64_t total = d->sample_count + n;
+    if (d->n_pending > 0 && total > d->ringbuf_size)
+        ring_protect(d, total - d->ringbuf_size);
+}
 
 /* Move the write position past n samples just stored at it */
 static void ringbuf_advance(burst_detector_t *d, size_t n) {
@@ -468,6 +594,7 @@ static void ringbuf_advance(burst_detector_t *d, size_t n) {
 
 /* n must not exceed the ring size (callers feed in chunks) */
 static void ringbuf_write(burst_detector_t *d, const float complex *samples, size_t n) {
+    ringbuf_reserve(d, n);
     size_t pos = d->ringbuf_write;
     size_t first = n <= d->ringbuf_size - pos ? n : d->ringbuf_size - pos;
     memcpy(&d->ringbuf[pos], samples, first * sizeof(float complex));
@@ -477,38 +604,13 @@ static void ringbuf_write(burst_detector_t *d, const float complex *samples, siz
 
 /* int8 IQ pairs converted straight into the ring */
 static void ringbuf_write_i8(burst_detector_t *d, const int8_t *iq, size_t n) {
+    ringbuf_reserve(d, n);
     size_t pos = d->ringbuf_write;
     size_t first = n <= d->ringbuf_size - pos ? n : d->ringbuf_size - pos;
     simd_convert_i8_cf(iq, &d->ringbuf[pos], first);
     if (n > first)
         simd_convert_i8_cf(iq + 2 * first, d->ringbuf, n - first);
     ringbuf_advance(d, n);
-}
-
-static float complex *ringbuf_extract(burst_detector_t *d, uint64_t start,
-                                       uint64_t stop, size_t *out_len) {
-    /* Clamp to available range */
-    if (start < d->ringbuf_start)
-        start = d->ringbuf_start;
-    if (stop <= start) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    size_t len = (size_t)(stop - start);
-    float complex *buf = malloc(sizeof(float complex) * len);
-    size_t rb_pos = (size_t)(start % d->ringbuf_size);
-
-    if (rb_pos + len <= d->ringbuf_size) {
-        memcpy(buf, &d->ringbuf[rb_pos], len * sizeof(float complex));
-    } else {
-        size_t first = d->ringbuf_size - rb_pos;
-        memcpy(buf, &d->ringbuf[rb_pos], first * sizeof(float complex));
-        memcpy(buf + first, d->ringbuf, (len - first) * sizeof(float complex));
-    }
-
-    *out_len = len;
-    return buf;
 }
 
 /* ---- Internal: update noise floor (pre) ---- */
@@ -796,20 +898,16 @@ static void emit_gone_bursts(burst_detector_t *d, burst_callback_t cb, void *use
     for (int i = 0; i < d->num_gone_bursts; i++) {
         active_burst_t *ab = &d->gone_bursts[i];
 
-        /* Extract IQ samples from ringbuffer */
-        uint64_t extract_start = ab->start;
-        uint64_t extract_stop = ab->stop;   /* [start, stop) as gr-iridium */
-        size_t num_samples;
-        float complex *samples = ringbuf_extract(d, extract_start, extract_stop,
-                                                  &num_samples);
-
-        if (num_samples == 0) {
-            free(samples);
+        /* IQ samples [start, stop) as gr-iridium, clamped to the ring */
+        uint64_t data_start = ab->start < d->ringbuf_start
+                            ? d->ringbuf_start : ab->start;
+        if (ab->stop <= data_start)
             continue;
-        }
+        size_t num_samples = (size_t)(ab->stop - data_start);
 
         /* Build burst data */
         burst_data_t *bd = malloc(sizeof(*bd));
+        if (!bd) errx(1, "burst_detect: out of memory");
         bd->info = (burst_info_t){
             .id = ab->id,
             .start = ab->start,
@@ -824,7 +922,18 @@ static void emit_gone_bursts(burst_detector_t *d, burst_callback_t cb, void *use
         bd->fft_size = d->fft_size;
         bd->start_time_ns = d->start_time_ns;
         bd->num_samples = num_samples;
-        bd->samples = samples;
+        bd->data_start = data_start;
+        size_t pos = (size_t)(data_start % d->ringbuf_size);
+        size_t first = d->ringbuf_size - pos;
+        if (first > num_samples) first = num_samples;
+        bd->seg[0] = &d->ringbuf[pos];
+        bd->seg_len[0] = first;
+        bd->seg[1] = d->ringbuf;
+        bd->seg_len[1] = num_samples - first;
+        bd->copy = NULL;
+        atomic_init(&bd->state, BS_RING);
+        atomic_init(&bd->refs, 2);
+        pending_add(d, bd);
 
         cb(bd, user);
         d->n_tagged_bursts++;
@@ -1011,8 +1120,7 @@ static void burst_to_queue(burst_data_t *burst, void *user) {
     Blocking_Queue *queue = (Blocking_Queue *)user;
     int ret = blocking_queue_put(queue, burst);
     if (ret != 0) {
-        free(burst->samples);
-        free(burst);
+        burst_release(burst);
         atomic_fetch_add(&stat_n_dropped, 1);
     }
 }

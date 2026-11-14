@@ -93,6 +93,7 @@ struct _burst_downmix {
     float *rs_scratch;          /* simd_fir_ccf_dec_seq scratch */
     size_t rs_scratch_len;
     float complex *rot_buf;     /* rotated input just ahead of stage 1 */
+    float complex *gather;      /* a ROT_CHUNK piece across the ring end */
     fir_filter_t *noise_fir;    /* noise-limiting LPF after decimation */
     fir_filter_t *start_fir;    /* magnitude smoothing */
     fir_filter_t *rrc_fir;      /* root-raised-cosine matched filter */
@@ -384,6 +385,8 @@ burst_downmix_t *burst_downmix_create(downmix_config_t *config) {
 
     /* ---- Working buffers (generous size, aligned for SIMD) ---- */
     dm->work_size = 2 * 1024 * 1024;  /* 2M samples max */
+    dm->gather = malloc(sizeof(float complex) * ROT_CHUNK);
+    if (!dm->gather) errx(1, "burst_downmix: out of memory");
     dm->work_a = aligned_alloc_32(sizeof(float complex) * dm->work_size);
     dm->work_b = aligned_alloc_32(sizeof(float complex) * dm->work_size);
     dm->mag_f = aligned_alloc_32(sizeof(float) * dm->work_size);
@@ -400,6 +403,7 @@ void burst_downmix_destroy(burst_downmix_t *dm) {
     free(dm->rs_int_taps);
     free(dm->rs_scratch);
     free(dm->rot_buf);
+    free(dm->gather);
     fir_filter_destroy(dm->noise_fir);
     fir_filter_destroy(dm->start_fir);
     fir_filter_destroy(dm->rrc_fir);
@@ -557,8 +561,26 @@ static int resample_stage2(burst_downmix_t *dm, const float complex *in,
  * rotator runs, so the rotator renormalizes at the same samples as one
  * call over the whole burst, and each FIR output depends only on its own
  * inputs, so the result matches rotate-then-filter exactly. */
-static int rotate_decimate(burst_downmix_t *dm, const float complex *in,
-                           int n, rotator_t *r, float complex *out)
+/* Input samples [pos, pos + c) of a burst held in two pieces, gathered
+ * into dm->gather when they straddle the pieces */
+static const float complex *burst_span(burst_downmix_t *dm,
+                                       const float complex *const seg[2],
+                                       const size_t len[2], size_t pos, int c)
+{
+    if (pos + c <= len[0])
+        return seg[0] + pos;
+    if (pos >= len[0])
+        return seg[1] + (pos - len[0]);
+    size_t a = len[0] - pos;
+    memcpy(dm->gather, seg[0] + pos, a * sizeof(float complex));
+    memcpy(dm->gather + a, seg[1], (c - a) * sizeof(float complex));
+    return dm->gather;
+}
+
+static int rotate_decimate(burst_downmix_t *dm,
+                           const float complex *const seg[2],
+                           const size_t len[2], int n, rotator_t *r,
+                           float complex *out)
 {
     const fir_filter_t *f = dm->rs_fir1;
     int ntaps = f->ntaps, dec = dm->rs_d1;
@@ -572,7 +594,8 @@ static int rotate_decimate(burst_downmix_t *dm, const float complex *in,
     int m = 0;
     while (m < n_out) {
         int c = n - rotated < ROT_CHUNK ? n - rotated : ROT_CHUNK;
-        simd_rotate(buf + have, in + rotated, c, &r->phase, r->phase_incr);
+        simd_rotate(buf + have, burst_span(dm, seg, len, rotated, c), c,
+                    &r->phase, r->phase_incr);
         rotated += c;
         have += c;
 
@@ -599,8 +622,10 @@ static int rotate_decimate(burst_downmix_t *dm, const float complex *in,
 /* Rotate by r and resample to the output rate. work is scratch the size
  * of the input; out receives the result. timestamp moves to output
  * sample 0. */
-static int resample_burst(burst_downmix_t *dm, const float complex *in,
-                          int in_len, rotator_t *r, float complex *work,
+static int resample_burst(burst_downmix_t *dm,
+                          const float complex *const seg[2],
+                          const size_t len[2], int in_len, rotator_t *r,
+                          float complex *work,
                           float complex *out, int in_sample_rate,
                           uint64_t *timestamp) {
     if (in_sample_rate != dm->rs_in_rate)
@@ -611,13 +636,20 @@ static int resample_burst(burst_downmix_t *dm, const float complex *in,
     double delay = 0;   /* input samples from in[0] to output sample 0 */
     float complex *dst;
     if (dm->rs_d1 > 1) {
-        n1 = rotate_decimate(dm, in, in_len, r, out);
+        n1 = rotate_decimate(dm, seg, len, in_len, r, out);
         if (n1 <= 0) return 0;
         s1 = out;
         dst = work;
         delay = (dm->rs_fir1->ntaps - 1) / 2.0;
     } else {
-        rotator_rotate_n(r, work, in, in_len);
+        if ((size_t)in_len <= len[0]) {
+            rotator_rotate_n(r, work, seg[0], in_len);
+        } else {
+            memcpy(work, seg[0], len[0] * sizeof(float complex));
+            memcpy(work + len[0], seg[1],
+                   (in_len - len[0]) * sizeof(float complex));
+            rotator_rotate_n(r, work, work, in_len);
+        }
         s1 = work;
         n1 = in_len;
         dst = out;
@@ -863,8 +895,12 @@ int burst_downmix_process(burst_downmix_t *dm, burst_data_t *burst,
     rotator_set_phase_incr(&coarse, cexpf(phase_inc * I));
     center_frequency += relative_freq * in_sample_rate;
 
-    int dec_len = resample_burst(dm, burst->samples, n, &coarse, dm->work_a,
+    const float complex *seg[2];
+    size_t len[2];
+    burst_samples_begin(burst, seg, len);
+    int dec_len = resample_burst(dm, seg, len, n, &coarse, dm->work_a,
                                  dm->work_b, in_sample_rate, &timestamp);
+    burst_samples_end(burst);
     if (dec_len < 100) {
         *frames_out = NULL;
         return 0;
@@ -1014,8 +1050,7 @@ void *burst_downmix_thread(void *arg) {
             free(frames);
         }
 
-        free(burst->samples);
-        free(burst);
+        burst_release(burst);
     }
 
     burst_downmix_destroy(dm);
