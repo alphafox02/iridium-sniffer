@@ -54,58 +54,92 @@ void avx2_fir_ccf(const float *taps, int ntaps,
     }
 }
 
-/* ---- Decimating complex FIR ----
- *
- * Can't batch outputs easily due to stride, so vectorize inner tap loop.
- * Process taps 8 at a time (4 complex values), accumulate horizontally.
- */
+/* ---- Decimating complex FIR ---- */
+
+/* Horizontal sum of acc = [re_a,im_a,re_b,im_b | re_c,im_c,re_d,im_d]
+ * to (re_a + re_c) + (re_b + re_d) in lanes 0 and 1 */
+static inline __m128 fir_dec_hsum(__m256 acc)
+{
+    __m128 sum = _mm_add_ps(_mm256_castps256_ps128(acc),
+                            _mm256_extractf128_ps(acc, 1));
+    __m128 pair_hi = _mm_shuffle_ps(sum, sum, _MM_SHUFFLE(3, 2, 3, 2));
+    return _mm_add_ps(sum, pair_hi);
+}
+
+/* Remaining taps (under four), written as the scalar loop the kernel
+ * always had so the compiler contracts it (or not) the same way */
+static inline void fir_dec_tail(__m128 r, const float *taps, int k,
+                                int ntaps, const float *p, float *out)
+{
+    float acc_re = _mm_cvtss_f32(r);
+    float acc_im = _mm_cvtss_f32(_mm_shuffle_ps(r, r, 1));
+    for (; k < ntaps; k++) {
+        acc_re += taps[k] * p[k * 2];
+        acc_im += taps[k] * p[k * 2 + 1];
+    }
+    out[0] = acc_re;
+    out[1] = acc_im;
+}
+
+/* Each output: four complex taps per fused multiply-add into one
+ * accumulator, the horizontal sum above, then the last ntaps % 4 taps.
+ * Four outputs run side by side on separate accumulators and the taps
+ * are paired up front ([t0,t0,t1,t1,...]); every output is computed with
+ * the same operations in the same order as one at a time. */
+#define FIR_DEC_MAX_TAPS 512
+
 void avx2_fir_ccf_dec(const float *taps, int ntaps,
                        const float complex *in, float complex *out,
                        int n_out, int decimation) {
     const float *inp = (const float *)in;
     float *outp = (float *)out;
+    int k4 = ntaps & ~3;            /* taps in the four-wide loop */
+    size_t step = (size_t)decimation * 2;
 
-    for (int i = 0; i < n_out; i++) {
-        const float *p = &inp[i * decimation * 2];
+    if (ntaps > FIR_DEC_MAX_TAPS) {
+        for (int i = 0; i < n_out; i++) {
+            const float *p = &inp[i * step];
+            __m256 acc = _mm256_setzero_ps();
+            for (int k = 0; k < k4; k += 4) {
+                __m128 t4 = _mm_loadu_ps(&taps[k]);
+                __m256 coeff = _mm256_set_m128(_mm_unpackhi_ps(t4, t4),
+                                               _mm_unpacklo_ps(t4, t4));
+                acc = _mm256_fmadd_ps(coeff, _mm256_loadu_ps(&p[k * 2]), acc);
+            }
+            fir_dec_tail(fir_dec_hsum(acc), taps, k4, ntaps, p, &outp[i * 2]);
+        }
+        return;
+    }
+
+    float tp[2 * FIR_DEC_MAX_TAPS] __attribute__((aligned(32)));
+    for (int k = 0; k < k4; k++)
+        tp[2 * k] = tp[2 * k + 1] = taps[k];
+
+    int i = 0;
+    for (; i + 4 <= n_out; i += 4) {
+        const float *p0 = &inp[i * step];
+        const float *p1 = p0 + step, *p2 = p1 + step, *p3 = p2 + step;
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        __m256 a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        for (int k = 0; k < k4; k += 4) {
+            __m256 c = _mm256_load_ps(&tp[2 * k]);
+            a0 = _mm256_fmadd_ps(c, _mm256_loadu_ps(&p0[k * 2]), a0);
+            a1 = _mm256_fmadd_ps(c, _mm256_loadu_ps(&p1[k * 2]), a1);
+            a2 = _mm256_fmadd_ps(c, _mm256_loadu_ps(&p2[k * 2]), a2);
+            a3 = _mm256_fmadd_ps(c, _mm256_loadu_ps(&p3[k * 2]), a3);
+        }
+        fir_dec_tail(fir_dec_hsum(a0), taps, k4, ntaps, p0, &outp[i * 2]);
+        fir_dec_tail(fir_dec_hsum(a1), taps, k4, ntaps, p1, &outp[i * 2 + 2]);
+        fir_dec_tail(fir_dec_hsum(a2), taps, k4, ntaps, p2, &outp[i * 2 + 4]);
+        fir_dec_tail(fir_dec_hsum(a3), taps, k4, ntaps, p3, &outp[i * 2 + 6]);
+    }
+    for (; i < n_out; i++) {
+        const float *p = &inp[i * step];
         __m256 acc = _mm256_setzero_ps();
-        int k = 0;
-
-        /* Process 4 taps at a time (each tap applied to 1 complex = 2 floats,
-         * but we pack 4 taps worth: 4 complex values = 8 floats) */
-        for (; k + 3 < ntaps; k += 4) {
-            /* Load 4 consecutive complex inputs */
-            __m256 data = _mm256_loadu_ps(&p[k * 2]);
-            /* Interleave coefficients: [t0,t0,t1,t1,t2,t2,t3,t3] */
-            __m128 t4 = _mm_loadu_ps(&taps[k]);
-            /* Duplicate each float: [t0,t1,t2,t3] -> [t0,t0,t1,t1 | t2,t2,t3,t3] */
-            __m128 lo_pair = _mm_unpacklo_ps(t4, t4);
-            __m128 hi_pair = _mm_unpackhi_ps(t4, t4);
-            __m256 coeff = _mm256_set_m128(hi_pair, lo_pair);
-
-            acc = _mm256_fmadd_ps(coeff, data, acc);
-        }
-
-        /* Horizontal sum of 4 complex accumulators -> 1 complex result */
-        /* acc = [re0,im0,re1,im1 | re2,im2,re3,im3] */
-        __m128 lo = _mm256_castps256_ps128(acc);
-        __m128 hi = _mm256_extractf128_ps(acc, 1);
-        __m128 sum = _mm_add_ps(lo, hi);  /* [re0+re2, im0+im2, re1+re3, im1+im3] */
-        /* Pair-wise add: (re0+re2)+(re1+re3), (im0+im2)+(im1+im3) */
-        __m128 pair_hi = _mm_shuffle_ps(sum, sum, _MM_SHUFFLE(3, 2, 3, 2));
-        __m128 result = _mm_add_ps(sum, pair_hi);
-        /* result[0] = re_total, result[1] = im_total */
-
-        float acc_re = _mm_cvtss_f32(result);
-        float acc_im = _mm_cvtss_f32(_mm_shuffle_ps(result, result, 1));
-
-        /* Scalar tail for remaining taps */
-        for (; k < ntaps; k++) {
-            acc_re += taps[k] * p[k * 2];
-            acc_im += taps[k] * p[k * 2 + 1];
-        }
-
-        outp[i * 2] = acc_re;
-        outp[i * 2 + 1] = acc_im;
+        for (int k = 0; k < k4; k += 4)
+            acc = _mm256_fmadd_ps(_mm256_load_ps(&tp[2 * k]),
+                                  _mm256_loadu_ps(&p[k * 2]), acc);
+        fir_dec_tail(fir_dec_hsum(acc), taps, k4, ntaps, p, &outp[i * 2]);
     }
 }
 
