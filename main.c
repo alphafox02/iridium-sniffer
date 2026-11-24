@@ -1038,7 +1038,8 @@ int main(int argc, char **argv) {
                     /* Try data/waypoints.csv next to exe */
                     snprintf(slash + 1, sizeof(wp_path) - (slash + 1 - wp_path),
                              "data/waypoints.csv");
-                    waypoint_db_load(wp_path);
+                    if (waypoint_db_load(wp_path) < 0)
+                        waypoint_db_load("/usr/share/iridium-sniffer/waypoints.csv");
                 }
             }
         }
